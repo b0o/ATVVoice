@@ -87,24 +87,11 @@ atvvoice -d <BT_ADDRESS> [OPTIONS]
 
 Without `-d`, ATVVoice scans bonded devices for the ATVV service UUID and connects to the first match. Use `-d` to target a specific remote by address.
 
+The remote appears as "ATVVoice Microphone" in PipeWire/PulseAudio audio input settings.
+
 ### Multiple remotes
 
-Each instance handles one remote. To use multiple remotes, run separate instances with `-d` for each:
-
-```
-atvvoice -d AA:BB:CC:DD:EE:FF &
-atvvoice -d 11:22:33:44:55:66 &
-```
-
-Each will appear as a separate PipeWire source. Note that the D-Bus bus name (`org.atvvoice`) and PipeWire node name (`atvvoice`) are currently shared — additional instances will start without D-Bus control and may have naming collisions. Per-device bus names and node names may be added in the future. If you need multi-remote support, please open an issue describing your setup.
-
-Example:
-
-```
-atvvoice -d AA:BB:CC:DD:EE:FF -v --idle-timeout 300
-```
-
-The remote appears as "ATVVoice Microphone" in PipeWire/PulseAudio audio input settings.
+An ATVVoice instance only handles one remote. To use multiple remotes, run separate instances with `-d` for each. Each will appear as a separate PipeWire source. Keep in mind, the D-Bus bus name (`org.atvvoice`) and PipeWire node name (`atvvoice`) are currently shared — additional instances will start without D-Bus control and may have naming collisions. Per-device bus names and node names may be added in the future. If you need multi-remote support, please open an issue describing your setup.
 
 ## Home Manager options
 
