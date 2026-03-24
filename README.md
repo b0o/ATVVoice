@@ -44,6 +44,20 @@ nixpkgs.overlays = [ inputs.atvvoice.overlays.default ];
 # then: pkgs.atvvoice
 ```
 
+### Pre-built binary
+
+Download from [GitHub Releases](https://github.com/b0o/atvvoice/releases):
+
+```
+curl -Lo atvvoice https://github.com/b0o/atvvoice/releases/latest/download/atvvoice-x86_64-linux
+chmod +x atvvoice
+sudo mv atvvoice /usr/local/bin/
+```
+
+Replace `x86_64-linux` with `aarch64-linux` for ARM64.
+
+Requires `libpipewire` and `libdbus` at runtime.
+
 ### Cargo
 
 ```
