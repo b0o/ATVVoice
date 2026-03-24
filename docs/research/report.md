@@ -439,8 +439,8 @@ nix shell nixpkgs#python3 nixpkgs#python3Packages.dbus-python nixpkgs#python3Pac
       frame format, ADPCM encoding, and GATT notification structure.
       https://github.com/Infineon/mtb-example-btstack-freertos-cyw20829-voice-remote
 
-[^6]: Google Voice over BLE spec v0.4 (Scribd upload, paywalled).
-      https://www.scribd.com/document/947499552/VoiceoverBLERemotecontrolspecs-Draft-Ver0-4
+[^6]: Google Voice over BLE spec v1.0.
+      https://web.archive.org/web/20260324183034/https://wangefan.github.io/linux_kernel_driver/resources/Google_Voice_over_BLE_spec_v1.0.pdf
 
 [^7]: Nordic DevZone discussion on Android TV voice input with Smart Remote 3.
       https://devzone.nordicsemi.com/f/nordic-q-a/25002/android-tv-voice-input-with-smart-remote-3

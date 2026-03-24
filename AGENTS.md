@@ -192,7 +192,7 @@ nix build            # Nix build
 - [BlueZ issue #1086](https://github.com/bluez/bluez/issues/1086) — Linux support request, protocol research
 - [Infineon CYW20829 Voice Remote](https://github.com/Infineon/mtb-example-btstack-freertos-cyw20829-voice-remote) — Reference firmware (source of truth for frame format)
 - [CSDN ATVV spec translation](https://blog.csdn.net/Weichen_Huang/article/details/109251338) — Command table, characteristic UUIDs
-- [Google Voice over BLE spec v0.4](https://www.scribd.com/document/947499552/VoiceoverBLERemotecontrolspecs-Draft-Ver0-4) — Official spec (paywalled)
+- [Google Voice over BLE spec v1.0](https://web.archive.org/web/20260324183034/https://wangefan.github.io/linux_kernel_driver/resources/Google_Voice_over_BLE_spec_v1.0.pdf) — Official spec
 
 ## Implementation Plan
 
