@@ -95,33 +95,33 @@
           };
 
           gain = mkOption {
-            type = types.number;
-            default = 20;
-            description = "Audio gain in dB.";
+            type = types.nullOr types.number;
+            default = null;
+            description = "Audio gain in dB. null = app default (20).";
           };
 
           mode = mkOption {
-            type = types.enum ["toggle" "hold"];
-            default = "toggle";
-            description = "Mic button mode: toggle (press on/off) or hold (hold to stream).";
+            type = types.nullOr (types.enum ["toggle" "hold"]);
+            default = null;
+            description = "Mic button mode. null = app default (toggle).";
           };
 
           frameTimeout = mkOption {
-            type = types.int;
-            default = 5;
-            description = "Seconds without audio frames before auto-closing mic. 0 = disabled.";
+            type = types.nullOr types.int;
+            default = null;
+            description = "Seconds without audio frames before auto-closing mic. null = app default (5). 0 = disabled.";
           };
 
           idleTimeout = mkOption {
-            type = types.int;
-            default = 0;
-            description = "Seconds since last button press before auto-closing mic. 0 = disabled.";
+            type = types.nullOr types.int;
+            default = null;
+            description = "Seconds since last button press before auto-closing mic. null = app default (0/disabled).";
           };
 
           verbose = mkOption {
-            type = types.ints.between 0 3;
-            default = 0;
-            description = "Log verbosity (0=info, 1=debug, 2+=trace).";
+            type = types.nullOr (types.ints.between 0 3);
+            default = null;
+            description = "Log verbosity. null = app default (0/info).";
           };
 
           noDbus = mkOption {
@@ -140,15 +140,13 @@
             };
             Service = let
               args =
-                [
-                  "-g" (toString cfg.gain)
-                  "-m" cfg.mode
-                  "--frame-timeout" (toString cfg.frameTimeout)
-                  "--idle-timeout" (toString cfg.idleTimeout)
-                ]
-                ++ lib.optionals (cfg.device != null) ["-d" cfg.device]
+                lib.optionals (cfg.device != null) ["-d" cfg.device]
                 ++ lib.optionals (cfg.adapter != null) ["-a" cfg.adapter]
-                ++ lib.genList (_: "-v") cfg.verbose
+                ++ lib.optionals (cfg.gain != null) ["-g" (toString cfg.gain)]
+                ++ lib.optionals (cfg.mode != null) ["-m" cfg.mode]
+                ++ lib.optionals (cfg.frameTimeout != null) ["--frame-timeout" (toString cfg.frameTimeout)]
+                ++ lib.optionals (cfg.idleTimeout != null) ["--idle-timeout" (toString cfg.idleTimeout)]
+                ++ lib.optionals (cfg.verbose != null) (lib.genList (_: "-v") cfg.verbose)
                 ++ lib.optionals cfg.noDbus ["--no-dbus"];
             in {
               Type = "simple";
