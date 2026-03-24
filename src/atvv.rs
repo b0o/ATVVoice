@@ -15,7 +15,9 @@ pub const CMD_MIC_CLOSE: &[u8] = &[0x0D];
 const CTL_AUDIO_STOP: u8 = 0x00;
 const CTL_AUDIO_START: u8 = 0x04;
 const CTL_START_SEARCH: u8 = 0x08;
+const CTL_AUDIO_SYNC: u8 = 0x0A;
 const CTL_GET_CAPS_RESP: u8 = 0x0B;
+const CTL_MIC_OPEN_ERROR: u8 = 0x0C;
 
 /// How the mic button behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -194,8 +196,17 @@ pub async fn run_session(
                             }
                         }
                     }
+                    CTL_AUDIO_SYNC => {
+                        tracing::debug!("AUDIO_SYNC: {:02x?}", &data);
+                    }
                     CTL_GET_CAPS_RESP => {
                         tracing::info!("GET_CAPS_RESP: {:02x?}", &data);
+                    }
+                    CTL_MIC_OPEN_ERROR => {
+                        tracing::warn!("MIC_OPEN_ERROR: {:02x?}", &data);
+                        if state == State::Opening {
+                            set_state(State::Ready, &mut state);
+                        }
                     }
                     other => {
                         tracing::debug!("Unknown CTL: 0x{:02x} data={:02x?}", other, &data);
