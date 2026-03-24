@@ -68,13 +68,13 @@ atvvoice [OPTIONS]
 | `--frame-timeout` | 5 | Seconds without frames before auto-closing mic (device asleep). 0 = disabled. |
 | `-t, --idle-timeout` | 0 | Seconds since last button press before auto-closing mic. 0 = disabled. |
 | `-n, --name` | | Instance name suffix. Sets PW node and D-Bus name (e.g. `--name living-room`). |
-| `--description` | ATVVoice Microphone | PipeWire node description (shown in audio settings) |
+| `--description` | BLE device name | PipeWire node description (shown in audio settings). Defaults to the remote's BLE name (e.g. "G20S PRO"). |
 | `--no-dbus` | | Disable D-Bus control interface |
 | `-v` | off | Verbosity (`-v` debug, `-vv` trace) |
 
 \*Not all remotes support hold-to-stream. The G20S Pro sends a button press event on both press and release, so it only works in toggle mode.
 
-The remote appears as "ATVVoice Microphone" in PipeWire/PulseAudio audio input settings. The microphone source appears when the device connects and disappears when it disconnects. ATVVoice automatically reconnects when the device comes back.
+The remote appears by its BLE device name (e.g. "G20S PRO") in PipeWire/PulseAudio audio input settings. The microphone source appears when the device connects and disappears when it disconnects. ATVVoice automatically reconnects when the device comes back.
 
 ### Multiple remotes
 
@@ -120,11 +120,11 @@ services.atvvoice = {
   verbose = 1;
 
   # Instance name suffix. Sets PW node name (atvvoice-<name>) and D-Bus name
-  # (org.atvvoice.<name>). null (default) = no suffix.
+  # (org.atvvoice.<name>). null (default) = derived from BLE device name.
   name = null;
 
   # PipeWire node description (shown in audio settings).
-  # null (default) = "ATVVoice Microphone" or "ATVVoice Microphone (<name>)".
+  # null (default) = BLE device name (e.g. "G20S PRO").
   description = null;
 
   # Disable D-Bus control interface. Default: false.
@@ -134,17 +134,17 @@ services.atvvoice = {
 
 ## D-Bus control interface
 
-When built with the `dbus` feature (enabled by default), ATVVoice exposes `org.atvvoice.Daemon` on the session bus. Disable at runtime with `--no-dbus`.
+When built with the `dbus` feature (enabled by default), ATVVoice exposes `org.atvvoice.<name>` on the session bus, where `<name>` is the instance name (auto-derived from BLE device name or set via `--name`). Disable at runtime with `--no-dbus`.
 
 ```
-# Toggle mic on/off
-busctl --user call org.atvvoice /org/atvvoice/Daemon org.atvvoice.Daemon MicToggle
+# Toggle mic on/off (replace g20s-pro with your instance name)
+busctl --user call org.atvvoice.g20s-pro /org/atvvoice/Daemon org.atvvoice.Daemon MicToggle
 
 # Query state
-busctl --user get-property org.atvvoice /org/atvvoice/Daemon org.atvvoice.Daemon State
+busctl --user get-property org.atvvoice.g20s-pro /org/atvvoice/Daemon org.atvvoice.Daemon State
 
 # Monitor state changes
-busctl --user monitor org.atvvoice
+busctl --user monitor org.atvvoice.g20s-pro
 ```
 
 | Methods | Description |
