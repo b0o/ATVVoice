@@ -321,6 +321,78 @@ minor artifacts:
 | Multi-byte fields | Big-endian throughout |
 | Protocol version | 0.4 |
 
+## Voice Button Hold Detection
+
+The G20S Pro manual instructs users to "press and hold" the voice button to
+activate the microphone and release to deactivate. We investigated whether
+hold/release state is detectable on any BLE channel.
+
+### Observed behavior
+
+The voice button fires an **instant press+release on every press**, regardless
+of physical hold duration. This was confirmed at three levels:
+
+**1. Linux input events (`evtest`):**
+
+```
+time 1774352650.499390, EV_KEY, KEY_VOICECOMMAND (582), value 1  (press)
+time 1774352650.499415, EV_KEY, KEY_VOICECOMMAND (582), value 0  (release)
+```
+
+Press and release arrive in the same BLE notification (~25µs apart). Holding
+the physical button produces no additional events — no repeat, no separate
+release on button-up. This is Consumer Control usage `0x00CF` ("Voice Command")
+from HID Report ID 3.
+
+**2. ATVV CTL characteristic (`ab5e0004`):**
+
+Each button press sends a single `START_SEARCH` (`0x08`). No corresponding
+"stop" signal arrives on button release. When already streaming, some remotes
+send `AUDIO_STOP` (`0x00`) on release — the G20S Pro does not; it sends another
+`START_SEARCH` instead.
+
+**3. Vendor service 0xFFF0 characteristics:**
+
+The device exposes a vendor service (`0xFFF0`) with four characteristics:
+
+| Handle | UUID   | Flags                          |
+|--------|--------|--------------------------------|
+| 004c   | FFF1   | read, write-without-response, notify |
+| 004f   | FFF2   | read, write-without-response, notify |
+| 0052   | FFF3   | read, write                    |
+| 0055   | FFF4   | read, write-without-response, notify |
+
+We subscribed to notifications on all three notify-capable vendor
+characteristics (FFF1, FFF2, FFF4) simultaneously with ATVV CTL and pressed
+the voice button multiple times:
+
+```
+1774353026.129 [ATVV-CTL:char0060] 08 ([8])    ← START_SEARCH
+1774353030.168 [ATVV-CTL:char0060] 08 ([8])    ← START_SEARCH
+(no events on vendor characteristics)
+```
+
+**No data appeared on any vendor characteristic during voice button interaction.**
+
+### 2.4GHz mode comparison
+
+The same instant press+release behavior was observed in 2.4GHz USB dongle mode
+using `xev`/`wev`, confirming this is a **firmware-level behavior** — not a
+BLE-specific limitation or something that could be worked around by listening
+to a different BLE channel.
+
+### Conclusion
+
+The G20S Pro firmware fires a single instantaneous press+release event for the
+voice button on every press. No BLE channel (ATVV CTL, HID reports, or vendor
+service 0xFFF0) exposes hold/release state. The manual's "hold to talk"
+instruction likely describes the expected UX on Android TV, where the host
+manages session duration via speech detection, not button hold state.
+
+**Implication for atvvoice:** Toggle mode (press to start, press to stop) is the
+correct default for this remote. A configurable `--mode hold` option exists for
+remotes that do send `AUDIO_STOP` on button release, per the ATVV spec.
+
 ## Tools Used
 
 - `bluetoothctl` — BLE pairing, GATT exploration
