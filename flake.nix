@@ -136,6 +136,12 @@
             description = "PipeWire node description (shown in audio settings). null = app default (ATVVoice Microphone).";
           };
 
+          dbusName = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "D-Bus bus name. null = app default (org.atvvoice).";
+          };
+
           noDbus = mkOption {
             type = types.bool;
             default = false;
@@ -161,6 +167,7 @@
                 ++ lib.optionals (cfg.verbose != null) (lib.genList (_: "-v") cfg.verbose)
                 ++ lib.optionals (cfg.nodeName != null) ["--node-name" cfg.nodeName]
                 ++ lib.optionals (cfg.nodeDescription != null) ["--node-description" cfg.nodeDescription]
+                ++ lib.optionals (cfg.dbusName != null) ["--dbus-name" cfg.dbusName]
                 ++ lib.optionals cfg.noDbus ["--no-dbus"];
             in {
               Type = "simple";

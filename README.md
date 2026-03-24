@@ -45,20 +45,6 @@ nixpkgs.overlays = [ inputs.atvvoice.overlays.default ];
 # then: pkgs.atvvoice
 ```
 
-### Pre-built binary
-
-Download from [GitHub Releases](https://github.com/b0o/atvvoice/releases):
-
-```
-curl -Lo atvvoice https://github.com/b0o/atvvoice/releases/latest/download/atvvoice-x86_64-linux
-chmod +x atvvoice
-sudo mv atvvoice /usr/local/bin/
-```
-
-Replace `x86_64-linux` with `aarch64-linux` for ARM64.
-
-Requires `libpipewire` and `libdbus` at runtime.
-
 ### Cargo
 
 ```
@@ -83,6 +69,7 @@ atvvoice [OPTIONS]
 | `-t, --idle-timeout` | 0 | Seconds since last button press before auto-closing mic. 0 = disabled. |
 | `--node-name` | atvvoice | PipeWire node name |
 | `--node-description` | ATVVoice Microphone | PipeWire node description (shown in audio settings) |
+| `--dbus-name` | org.atvvoice | D-Bus bus name |
 | `--no-dbus` | | Disable D-Bus control interface |
 | `-v` | off | Verbosity (`-v` debug, `-vv` trace) |
 
@@ -93,13 +80,11 @@ The remote appears as "ATVVoice Microphone" in PipeWire/PulseAudio audio input s
 ### Multiple remotes
 
 Each ATVVoice instance handles one remote. To use multiple remotes, run separate instances with different `-d` addresses and `--node-name`/`--node-description` to avoid PipeWire naming collisions:
-
+C
 ```
-atvvoice -d AA:BB:CC:DD:EE:FF --node-name atvvoice-living-room --node-description "Living Room Remote" &
-atvvoice -d 11:22:33:44:55:66 --node-name atvvoice-bedroom --node-description "Bedroom Remote" &
+atvvoice -d AA:BB:CC:DD:EE:FF --node-name atvvoice-living-room --node-description "Living Room Remote" --dbus-name org.atvvoice.living_room &
+atvvoice -d 11:22:33:44:55:66 --node-name atvvoice-bedroom --node-description "Bedroom Remote" --dbus-name org.atvvoice.bedroom &
 ```
-
-Note: the D-Bus bus name (`org.atvvoice`) can only be claimed by one instance. Use `--no-dbus` on additional instances. Per-device bus names may be added in the future. If you need better multi-remote support, please open an issue describing your setup.
 
 ## Home Manager options
 
@@ -139,6 +124,9 @@ services.atvvoice = {
   # PipeWire node description (shown in audio settings).
   # null (default) = "ATVVoice Microphone".
   nodeDescription = null;
+
+  # D-Bus bus name. null (default) = "org.atvvoice".
+  dbusName = null;
 
   # Disable D-Bus control interface. Default: false.
   noDbus = false;

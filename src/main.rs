@@ -42,6 +42,11 @@ struct Cli {
     #[arg(long, default_value = "ATVVoice Microphone")]
     node_description: String,
 
+    /// D-Bus bus name
+    #[cfg(feature = "dbus")]
+    #[arg(long, default_value = "org.atvvoice")]
+    dbus_name: String,
+
     /// Disable D-Bus control interface
     #[cfg(feature = "dbus")]
     #[arg(long)]
@@ -148,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             device_address: device_addr,
             node_name: node_name.clone(),
         };
-        match dbus::serve(_state_rx, info).await {
+        match dbus::serve(_state_rx, info, &cli.dbus_name).await {
             Ok((cmd_rx, conn)) => (Some(cmd_rx), Some(conn)),
             Err(e) => {
                 tracing::warn!("Failed to register D-Bus interface: {}", e);

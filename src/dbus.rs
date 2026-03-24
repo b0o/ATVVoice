@@ -107,12 +107,13 @@ fn state_to_str(s: State) -> &'static str {
 pub async fn serve(
     state_rx: watch::Receiver<State>,
     info: DaemonInfo,
+    bus_name: &str,
 ) -> anyhow::Result<(mpsc::Receiver<ExternalCommand>, zbus::Connection)> {
     let (command_tx, command_rx) = mpsc::channel::<ExternalCommand>(16);
     let iface = DaemonInterface::new(command_tx, state_rx.clone(), info);
 
     let connection = zbus::connection::Builder::session()?
-        .name("org.atvvoice")?
+        .name(bus_name)?
         .serve_at("/org/atvvoice/Daemon", iface)?
         .build()
         .await?;
