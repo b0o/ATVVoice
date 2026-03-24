@@ -287,9 +287,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decoder_handle.abort();
         let _ = pw_thread.join();
 
-        match session_result {
+        match &session_result {
             Ok(()) => tracing::info!("Session ended"),
-            Err(e) => tracing::warn!("Session error: {}", e),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("exclusive") || msg.contains("NotPermitted") || msg.contains("InProgress") {
+                    // Device is locked by another instance — fatal, don't retry.
+                    tracing::error!("{e}");
+                    std::process::exit(1);
+                }
+                tracing::warn!("Session error: {e}");
+            }
         }
 
         // Update D-Bus state
