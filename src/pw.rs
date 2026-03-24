@@ -3,19 +3,24 @@
 //! Runs on a dedicated OS thread (not tokio-compatible). Receives decoded PCM
 //! frames via [`std::sync::mpsc`] and pushes them to PipeWire as a virtual
 //! microphone source.
+//!
+//! Uses reference-counted PipeWire types (`MainLoopRc`, `ContextRc`, `CoreRc`,
+//! `StreamRc`) so the mainloop stays alive during `Stream::drop`, avoiding
+//! SEGV in `pw_stream_destroy` / `pw_main_loop_destroy`.
 
 use std::io;
 use std::sync::mpsc;
 
+use pipewire::context::ContextRc;
 use pipewire::keys;
-use pipewire::main_loop::MainLoop;
+use pipewire::main_loop::MainLoopRc;
 use pipewire::properties::properties;
 use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
 use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Object, Pod, Value};
 use pipewire::spa::utils::{Direction, SpaTypes};
-use pipewire::stream::{Stream, StreamFlags};
+use pipewire::stream::{StreamFlags, StreamRc};
 
 /// Sample rate for ATVV audio (8 kHz mono).
 const SAMPLE_RATE: u32 = 8000;
@@ -34,10 +39,6 @@ pub struct Shutdown;
 /// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
 /// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
 ///
-/// The caller is responsible for sending `Shutdown` when the session ends.
-/// This ensures the PipeWire stream is disconnected while the mainloop is still
-/// alive, so the node disappears cleanly from audio settings.
-///
 /// Call from a dedicated `std::thread::spawn`.
 pub fn run_pw_source(
     audio_rx: mpsc::Receiver<Vec<i16>>,
@@ -48,12 +49,12 @@ pub fn run_pw_source(
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
-    let mainloop = MainLoop::new(None)?;
-    let context = pipewire::context::Context::new(&mainloop)?;
-    let core = context.connect(None)?;
+    let mainloop = MainLoopRc::new(None)?;
+    let context = ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
 
-    let stream = Stream::new(
-        &core,
+    let stream = StreamRc::new(
+        core,
         node_name,
         properties! {
             *keys::MEDIA_TYPE => "Audio",
@@ -83,8 +84,6 @@ pub fn run_pw_source(
                             buf.extend_from_slice(&frame);
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
-                        // Channel disconnected — just stop draining.
-                        // The Shutdown message will arrive shortly to do orderly teardown.
                         Err(mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
@@ -172,37 +171,32 @@ pub fn run_pw_source(
 
     tracing::info!("PipeWire source running (8kHz S16LE mono, gain={gain_db}dB)");
 
-    // Attach shutdown receiver to the mainloop event sources.
-    // When Shutdown arrives, disconnect the stream (removes the PW node from
-    // the audio graph) and quit the mainloop — all while the loop is still
-    // running. This follows the pattern used by RustAudio/cpal.
-    let mainloop_weak = mainloop.downgrade();
+    // Shutdown handler: disconnect + quit while the loop is alive.
+    // Uses StreamRc clone so the stream can be shared.
+    // Following the pattern from RustAudio/cpal.
+    let stream_clone = stream.clone();
+    let mainloop_clone = mainloop.clone();
     let _shutdown = shutdown_rx.attach(mainloop.loop_(), move |_: Shutdown| {
         tracing::info!("PipeWire source shutting down");
-        let _ = stream.disconnect();
-        if let Some(ml) = mainloop_weak.upgrade() {
-            ml.quit();
-        }
+        let _ = stream_clone.disconnect();
+        mainloop_clone.quit();
     });
 
     // Blocks until quit is called from the shutdown handler.
     mainloop.run();
 
-    // stream.disconnect() was already called inside the shutdown handler
-    // while the loop was alive. Leak all PipeWire objects to avoid SEGV
-    // during drop — pw_main_loop_destroy crashes when called after quit
-    // if streams/listeners still hold internal references to the loop.
-    // The OS reclaims all resources when this thread exits.
-    //
-    // This matches observations from RustAudio/cpal where explicit drops
-    // after mainloop.run() cause crashes in libpipewire's cleanup code.
-    std::mem::forget(_listener);
-    std::mem::forget(_shutdown);
-    std::mem::forget(core);
-    std::mem::forget(context);
-    std::mem::forget(mainloop);
+    // Orderly teardown. StreamRc/CoreRc/ContextRc/MainLoopRc use Rc internally,
+    // so the mainloop stays alive until the last reference is dropped. This means
+    // pw_stream_destroy (called by StreamRc::drop) can safely access the loop.
+    // Drop in dependency order: listener first, then stream, then infra.
+    drop(_listener);
+    drop(_shutdown);
+    drop(stream);
+    drop(context);
+    // mainloop dropped last (implicit)
 
     tracing::info!("PipeWire source stopped");
+    unsafe { pipewire::deinit() };
 
     Ok(())
 }
