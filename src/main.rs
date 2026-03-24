@@ -176,10 +176,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
 
+        // PipeWire channel for clean shutdown signaling.
+        let (pw_shutdown_tx, pw_shutdown_rx) = pipewire::channel::channel::<pw::Shutdown>();
+
         let pw_name = node_name.clone();
         let pw_desc = node_description.clone();
         let pw_thread = std::thread::spawn(move || {
-            if let Err(e) = pw::run_pw_source(pcm_rx, gain, &pw_name, &pw_desc) {
+            if let Err(e) = pw::run_pw_source(pcm_rx, gain, &pw_name, &pw_desc, pw_shutdown_rx) {
                 tracing::error!("PipeWire error: {}", e);
             }
         });
@@ -215,13 +218,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Send MIC_CLOSE on graceful shutdown
                 let _ = chars.tx.write(atvv::CMD_MIC_CLOSE).await;
                 tracing::info!("Sent MIC_CLOSE, shutting down");
+                // Signal PW thread to disconnect stream and quit cleanly.
+                let _ = pw_shutdown_tx.send(pw::Shutdown);
                 break;
             }
         };
 
-        // Session ended — tear down audio pipeline.
-        // Dropping frame_tx closes the channel, which causes decoder to end,
-        // which drops pcm_tx, which causes PW thread to detect Disconnected and quit.
+        // Session ended — signal PipeWire to disconnect stream cleanly (removes
+        // the node from audio settings), then wait for the thread to finish.
+        let _ = pw_shutdown_tx.send(pw::Shutdown);
         decoder_handle.abort();
         let _ = pw_thread.join();
 

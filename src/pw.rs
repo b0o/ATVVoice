@@ -5,11 +5,10 @@
 //! microphone source.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 
 use pipewire::keys;
+use pipewire::main_loop::MainLoop;
 use pipewire::properties::properties;
 use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
 use pipewire::spa::param::ParamType;
@@ -27,34 +26,32 @@ const CHANNELS: u32 = 1;
 /// Size of one sample in bytes (i16 = 2 bytes).
 const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 
+/// Signal to shut down the PipeWire source cleanly.
+pub struct Shutdown;
+
 /// Run the PipeWire audio source on the current thread (blocking).
 ///
 /// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
-/// virtual microphone. Each received `Vec<i16>` is one decoded ATVV frame
-/// (typically 257 samples at 8 kHz).
+/// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
 ///
-/// Gain (in dB) is applied to samples before writing to PipeWire.
+/// The caller is responsible for sending `Shutdown` when the session ends.
+/// This ensures the PipeWire stream is disconnected while the mainloop is still
+/// alive, so the node disappears cleanly from audio settings.
 ///
-/// # Threading
-///
-/// This function blocks the calling thread by running the PipeWire main loop.
 /// Call from a dedicated `std::thread::spawn`.
-/// Runs the PipeWire audio source. Returns when the `audio_rx` channel
-/// disconnects (all senders dropped).
 pub fn run_pw_source(
     audio_rx: mpsc::Receiver<Vec<i16>>,
     gain_db: f32,
     node_name: &str,
     node_description: &str,
+    shutdown_rx: pipewire::channel::Receiver<Shutdown>,
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
-    let mainloop = pipewire::main_loop::MainLoop::new(None)?;
+    let mainloop = MainLoop::new(None)?;
     let context = pipewire::context::Context::new(&mainloop)?;
     let core = context.connect(None)?;
 
-    // Create the stream with media properties so it appears as a microphone
-    // source in PipeWire/PulseAudio desktop audio settings.
     let stream = Stream::new(
         &core,
         node_name,
@@ -69,13 +66,7 @@ pub fn run_pw_source(
     )?;
 
     // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
-    // The process callback drains from the front.
     let pending: std::cell::RefCell<Vec<i16>> = std::cell::RefCell::new(Vec::new());
-
-    // Shared flag: process callback sets this when the audio channel disconnects.
-    // A timer on the mainloop checks it and performs orderly teardown.
-    let should_quit = Arc::new(AtomicBool::new(false));
-    let should_quit_cb = should_quit.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -83,7 +74,6 @@ pub fn run_pw_source(
             tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
         })
         .process(move |stream, _| {
-            // Drain any newly arrived frames from the channel into our pending buffer.
             {
                 let mut buf = pending.borrow_mut();
                 loop {
@@ -93,10 +83,9 @@ pub fn run_pw_source(
                             buf.extend_from_slice(&frame);
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            should_quit_cb.store(true, Ordering::Relaxed);
-                            return;
-                        }
+                        // Channel disconnected — just stop draining.
+                        // The Shutdown message will arrive shortly to do orderly teardown.
+                        Err(mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
             }
@@ -105,8 +94,6 @@ pub fn run_pw_source(
                 return;
             };
 
-            // How many frames (samples) PipeWire wants this cycle.
-            // A value of 0 means "no preference" — use the full buffer capacity.
             let requested = pw_buf.requested() as usize;
 
             let Some(pw_data) = pw_buf.datas_mut().first_mut() else {
@@ -117,7 +104,6 @@ pub fn run_pw_source(
                 return;
             };
 
-            // Cap to the actual mapped buffer capacity.
             let buf_capacity = slice.len() / SAMPLE_SIZE;
             let max_samples = if requested > 0 {
                 buf_capacity.min(requested)
@@ -128,7 +114,6 @@ pub fn run_pw_source(
             let mut buf = pending.borrow_mut();
             let available = buf.len().min(max_samples);
 
-            // Write available samples as little-endian i16 into the PipeWire buffer.
             for (i, &sample) in buf.iter().take(available).enumerate() {
                 let bytes = sample.to_le_bytes();
                 let offset = i * SAMPLE_SIZE;
@@ -136,19 +121,16 @@ pub fn run_pw_source(
                 slice[offset + 1] = bytes[1];
             }
 
-            // Fill remaining with silence (zeros).
             let silence_start = available * SAMPLE_SIZE;
             let silence_end = max_samples * SAMPLE_SIZE;
             for byte in &mut slice[silence_start..silence_end] {
                 *byte = 0;
             }
 
-            // Consume the samples we wrote.
             if available > 0 {
                 buf.drain(..available);
             }
 
-            // Tell PipeWire how much data we produced.
             let chunk = pw_data.chunk_mut();
             *chunk.offset_mut() = 0;
             *chunk.stride_mut() = SAMPLE_SIZE as i32;
@@ -162,8 +144,6 @@ pub fn run_pw_source(
     audio_info.set_rate(SAMPLE_RATE);
     audio_info.set_channels(CHANNELS);
 
-    // Set channel position to MONO so PipeWire routes to both L+R.
-    // Without this, PipeWire defaults to FL (front left) = left channel only.
     let mut position = [0u32; 64];
     position[0] = pipewire::spa::sys::SPA_AUDIO_CHANNEL_MONO;
     audio_info.set_position(position);
@@ -183,7 +163,6 @@ pub fn run_pw_source(
 
     let mut params = [Pod::from_bytes(&values).expect("invalid pod bytes")];
 
-    // Direction::Output = audio source (we output data TO PipeWire).
     stream.connect(
         Direction::Output,
         None,
@@ -193,40 +172,29 @@ pub fn run_pw_source(
 
     tracing::info!("PipeWire source running (8kHz S16LE mono, gain={gain_db}dB)");
 
-    // Poll for shutdown every 100ms. When the process callback signals disconnect,
-    // we disconnect the stream (removing it from PipeWire) while the loop is still
-    // alive, then quit. This avoids the pw_loop_check SEGV that happens if
-    // Stream is dropped after MainLoop has exited.
-    let timer = mainloop.loop_().add_timer({
-        let should_quit = should_quit.clone();
-        let mainloop_weak = mainloop.downgrade();
-        move |_| {
-            if should_quit.load(Ordering::Relaxed) {
-                tracing::info!("Audio channel disconnected, stopping PipeWire source");
-                if let Some(ml) = mainloop_weak.upgrade() {
-                    ml.quit();
-                }
-            }
+    // Attach shutdown receiver to the mainloop event sources.
+    // When Shutdown arrives, disconnect the stream (removes the PW node from
+    // the audio graph) and quit the mainloop — all while the loop is still
+    // running. This follows the pattern used by RustAudio/cpal.
+    let mainloop_weak = mainloop.downgrade();
+    let _shutdown = shutdown_rx.attach(mainloop.loop_(), move |_: Shutdown| {
+        tracing::info!("PipeWire source shutting down");
+        let _ = stream.disconnect();
+        if let Some(ml) = mainloop_weak.upgrade() {
+            ml.quit();
         }
     });
-    timer.update_timer(
-        Some(std::time::Duration::from_millis(100)),
-        Some(std::time::Duration::from_millis(100)),
-    );
 
-    // Blocks until quit is called from the timer callback.
+    // Blocks until quit is called from the shutdown handler.
     mainloop.run();
 
-    // Orderly teardown while mainloop infrastructure is still intact.
-    // disconnect() removes the stream from PipeWire's graph (node disappears
-    // from pavucontrol). Then normal Rust drop order handles the rest.
-    let _ = stream.disconnect();
+    // After mainloop.run() returns, stream.disconnect() was already called
+    // inside the shutdown handler while the loop was alive. Drop order:
+    // listener, shutdown handler, core, context, mainloop.
     drop(_listener);
-    drop(timer);
-    drop(stream);
+    drop(_shutdown);
     drop(core);
     drop(context);
-    // MainLoop is dropped last (implicit).
 
     tracing::info!("PipeWire source stopped");
     unsafe { pipewire::deinit() };
