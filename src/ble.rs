@@ -68,7 +68,9 @@ impl BleDevice for BluerDevice<'_> {
         >,
     > {
         Box::pin(async {
-            let reader = self.chars.ctl.notify_io().await?;
+            let reader = self.chars.ctl.notify_io().await
+                .context("Failed to acquire exclusive CTL notifications. \
+                          Another ATVVoice instance may be connected to this device.")?;
             tracing::debug!("CTL AcquireNotify: exclusive access, MTU={}", reader.mtu());
             Ok(reader_to_stream(reader))
         })
@@ -85,7 +87,9 @@ impl BleDevice for BluerDevice<'_> {
         >,
     > {
         Box::pin(async {
-            let reader = self.chars.rx.notify_io().await?;
+            let reader = self.chars.rx.notify_io().await
+                .context("Failed to acquire exclusive RX notifications. \
+                          Another ATVVoice instance may be connected to this device.")?;
             tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", reader.mtu());
             Ok(reader_to_stream(reader))
         })
