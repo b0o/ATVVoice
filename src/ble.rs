@@ -6,6 +6,18 @@ use futures::{Stream, StreamExt};
 
 use crate::atvv::{BleDevice, DeviceConnectionEvent};
 
+/// Wrap a `CharacteristicReader` (from `AcquireNotify`) into a `Stream<Item = Vec<u8>>`.
+fn reader_to_stream(
+    reader: bluer::gatt::CharacteristicReader,
+) -> Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> {
+    Box::pin(futures::stream::unfold(reader, |reader| async move {
+        match reader.recv().await {
+            Ok(data) => Some((data, reader)),
+            Err(_) => None, // FD closed (device disconnected)
+        }
+    }))
+}
+
 /// ATVV Service UUID: AB5E0001-5A21-4F05-BC7D-AF01F617B664
 pub const ATVV_SERVICE: Uuid = Uuid::from_u128(0xab5e0001_5a21_4f05_bc7d_af01f617b664);
 
@@ -56,8 +68,9 @@ impl BleDevice for BluerDevice<'_> {
         >,
     > {
         Box::pin(async {
-            let stream = self.chars.ctl.notify().await?;
-            Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>)
+            let reader = self.chars.ctl.notify_io().await?;
+            tracing::debug!("CTL AcquireNotify: exclusive access, MTU={}", reader.mtu());
+            Ok(reader_to_stream(reader))
         })
     }
 
@@ -72,8 +85,9 @@ impl BleDevice for BluerDevice<'_> {
         >,
     > {
         Box::pin(async {
-            let stream = self.chars.rx.notify().await?;
-            Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>)
+            let reader = self.chars.rx.notify_io().await?;
+            tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", reader.mtu());
+            Ok(reader_to_stream(reader))
         })
     }
 
