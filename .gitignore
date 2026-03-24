@@ -4,6 +4,9 @@ docs/session-handoffs/*
 # Created by https://www.toptal.com/developers/gitignore/api/direnv,linux,rust
 # Edit at https://www.toptal.com/developers/gitignore?templates=direnv,linux,rust
 
+### Nix ###
+result
+
 ### direnv ###
 .direnv
 .envrc
