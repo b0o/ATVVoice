@@ -197,6 +197,13 @@ pub fn run_pw_source(
     // Blocks until the main loop is quit (by the process callback on channel disconnect).
     mainloop.run();
 
+    // Explicit drop order to avoid use-after-free in PipeWire hooks:
+    // 1. Disconnect the stream (removes it from PipeWire graph)
+    // 2. Drop listener (removes hook callbacks)
+    // 3. Drop stream, core, context, mainloop (natural reverse order)
+    stream.disconnect()?;
+    drop(_listener);
+
     tracing::info!("PipeWire source stopped");
     unsafe { pipewire::deinit() };
 
