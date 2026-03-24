@@ -133,6 +133,15 @@ services.atvvoice = {
 
   # Log verbosity: 0 (default) = info, 1 = debug, 2+ = trace.
   verbose = 1;
+
+  # PipeWire node name. null (default) = "atvvoice".
+  nodeName = null;
+
+  # PipeWire node description (shown in audio settings). null (default) = "ATVVoice Microphone".
+  nodeDescription = null;
+
+  # Disable D-Bus control interface. Default: false.
+  noDbus = false;
 };
 ```
 
