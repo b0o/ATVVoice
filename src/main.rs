@@ -199,7 +199,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match dbus::serve(_state_rx, info, &dbus_name).await {
             Ok((cmd_rx, conn)) => (Some(cmd_rx), Some(conn)),
             Err(e) => {
-                tracing::warn!("Failed to register D-Bus interface: {}", e);
+                let msg = e.to_string();
+                if msg.contains("already taken") || msg.contains("NameAlreadyOwned") || msg.contains("exists") {
+                    tracing::error!(
+                        "D-Bus name '{dbus_name}' is already in use. \
+                         Another ATVVoice instance may be running with the same name. \
+                         Use --name <suffix> to differentiate instances, or --no-dbus to disable."
+                    );
+                    std::process::exit(1);
+                }
+                tracing::warn!("Failed to register D-Bus interface: {e}");
                 (None, None)
             }
         }
