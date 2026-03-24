@@ -188,16 +188,21 @@ pub fn run_pw_source(
     // Blocks until quit is called from the shutdown handler.
     mainloop.run();
 
-    // After mainloop.run() returns, stream.disconnect() was already called
-    // inside the shutdown handler while the loop was alive. Drop order:
-    // listener, shutdown handler, core, context, mainloop.
-    drop(_listener);
-    drop(_shutdown);
-    drop(core);
-    drop(context);
+    // stream.disconnect() was already called inside the shutdown handler
+    // while the loop was alive. Leak all PipeWire objects to avoid SEGV
+    // during drop — pw_main_loop_destroy crashes when called after quit
+    // if streams/listeners still hold internal references to the loop.
+    // The OS reclaims all resources when this thread exits.
+    //
+    // This matches observations from RustAudio/cpal where explicit drops
+    // after mainloop.run() cause crashes in libpipewire's cleanup code.
+    std::mem::forget(_listener);
+    std::mem::forget(_shutdown);
+    std::mem::forget(core);
+    std::mem::forget(context);
+    std::mem::forget(mainloop);
 
     tracing::info!("PipeWire source stopped");
-    unsafe { pipewire::deinit() };
 
     Ok(())
 }
