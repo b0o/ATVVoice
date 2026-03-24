@@ -52,7 +52,7 @@ struct Cli {
     verbose: u8,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -93,15 +93,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dbus")]
     let device_addr = device.address().to_string();
 
-    // Connect if needed (retries until connected)
+    // Wait for device to be connected, using event stream if possible.
     async fn ensure_connected(device: &bluer::Device) {
-        loop {
-            match device.is_connected().await {
-                Ok(true) => return,
-                _ => {
-                    tracing::info!("Waiting for device to connect...");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if device.is_connected().await.unwrap_or(false) {
+            return;
+        }
+        tracing::info!("Waiting for device to connect...");
+        // Try event-driven wait first
+        if let Ok(mut events) = device.events().await {
+            while let Some(event) = futures::StreamExt::next(&mut events).await {
+                if let bluer::DeviceEvent::PropertyChanged(
+                    bluer::DeviceProperty::Connected(true),
+                ) = event
+                {
+                    return;
                 }
+            }
+        }
+        // Fallback: poll
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if device.is_connected().await.unwrap_or(false) {
+                return;
             }
         }
     }
@@ -185,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             result = atvv::run_session(
+                &device,
                 &chars,
                 frame_tx.clone(),
                 cli.mode,

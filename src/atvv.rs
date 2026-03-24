@@ -59,6 +59,7 @@ pub struct SessionTimeouts {
 /// State changes are broadcast via `state_tx` (for D-Bus signals, etc.).
 /// Returns on device disconnect or unrecoverable error.
 pub async fn run_session(
+    device: &bluer::Device,
     chars: &AtvvChars,
     audio_tx: mpsc::Sender<Vec<u8>>,
     mic_mode: MicMode,
@@ -82,6 +83,10 @@ pub async fn run_session(
     let rx_stream = chars.rx.notify().await?;
     tokio::pin!(ctl_stream);
     tokio::pin!(rx_stream);
+
+    // Monitor device connection state
+    let device_events = device.events().await?;
+    tokio::pin!(device_events);
 
     // Send GET_CAPS
     chars.tx.write(CMD_GET_CAPS).await?;
@@ -249,6 +254,14 @@ pub async fn run_session(
                 let _ = chars.tx.write(CMD_MIC_CLOSE).await;
                 set_state(State::Ready, &mut state);
                 last_seq = None;
+            }
+            Some(event) = device_events.next() => {
+                if let bluer::DeviceEvent::PropertyChanged(
+                    bluer::DeviceProperty::Connected(false)
+                ) = event {
+                    tracing::info!("Device disconnected");
+                    break;
+                }
             }
             else => {
                 tracing::info!("Notification streams ended");
