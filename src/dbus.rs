@@ -142,6 +142,6 @@ pub async fn serve(
         }
     });
 
-    tracing::info!("D-Bus interface registered on session bus (org.atvvoice)");
+    tracing::info!("D-Bus interface registered on session bus ({bus_name})");
     Ok((command_rx, connection))
 }
