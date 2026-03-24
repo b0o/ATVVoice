@@ -35,13 +35,10 @@ struct Cli {
     idle_timeout: u64,
 
     /// Instance name suffix. Sets PipeWire node name and D-Bus bus name.
-    /// e.g. --name living-room → node "atvvoice-living-room",
-    /// D-Bus "org.atvvoice.living-room"
     #[arg(short, long)]
     name: Option<String>,
 
     /// PipeWire node description (shown in audio settings).
-    /// Default: "ATVVoice Microphone" (or "ATVVoice Microphone (<name>)" if --name is set)
     #[arg(long)]
     description: Option<String>,
 
@@ -69,6 +66,36 @@ fn sanitize_name(s: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
+/// Wait for device to be connected, using event stream if possible.
+async fn ensure_connected(device: &bluer::Device) {
+    if device.is_connected().await.unwrap_or(false) {
+        return;
+    }
+    tracing::info!("Waiting for device to connect...");
+    if let Ok(mut events) = device.events().await {
+        while let Some(event) = futures::StreamExt::next(&mut events).await {
+            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(true)) =
+                event
+            {
+                return;
+            }
+        }
+    }
+    // Fallback: poll
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if device.is_connected().await.unwrap_or(false) {
+            return;
+        }
+    }
+}
+
+/// Check if an error indicates the device is locked by another instance.
+fn is_device_locked_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("exclusive") || msg.contains("NotPermitted") || msg.contains("InProgress")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -86,6 +113,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Validate --name early.
+    if let Some(ref name) = cli.name {
+        let sanitized = sanitize_name(name);
+        if sanitized != *name {
+            eprintln!(
+                "error: --name {name:?} contains invalid characters. \
+                 Use lowercase alphanumeric, hyphens, and underscores only (e.g. --name {sanitized:?})."
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Connect to BlueZ
     let session = bluer::Session::new().await?;
     let adapter = match &cli.adapter {
@@ -94,127 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tracing::info!("Using adapter: {}", adapter.name());
 
-    // Parse optional address filter
-    let filter_addr = cli.device.map(|s| s.parse()).transpose()?;
-
-    // Find ATVV device (retries until found)
-    let device = loop {
-        match ble::find_atvv_device(&adapter, filter_addr).await {
-            Ok(device) => break device,
-            Err(e) => {
-                tracing::info!("No ATVV device found ({e}), retrying in 5s...");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-    };
-    #[cfg(feature = "dbus")]
-    let device_addr = device.address().to_string();
-
-    // Wait for device to be connected, using event stream if possible.
-    async fn ensure_connected(device: &bluer::Device) {
-        if device.is_connected().await.unwrap_or(false) {
-            return;
-        }
-        tracing::info!("Waiting for device to connect...");
-        // Try event-driven wait first
-        if let Ok(mut events) = device.events().await {
-            while let Some(event) = futures::StreamExt::next(&mut events).await {
-                if let bluer::DeviceEvent::PropertyChanged(
-                    bluer::DeviceProperty::Connected(true),
-                ) = event
-                {
-                    return;
-                }
-            }
-        }
-        // Fallback: poll
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if device.is_connected().await.unwrap_or(false) {
-                return;
-            }
-        }
-    }
-    ensure_connected(&device).await;
-
-    // Resolve GATT characteristics (retries on failure)
-    let mut chars = loop {
-        match ble::resolve_chars(&device).await {
-            Ok(c) => {
-                tracing::info!("ATVV characteristics resolved");
-                break c;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to resolve characteristics ({e}), retrying in 2s...");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-    };
-
-    let gain = cli.gain;
-    let ble_name = device.name().await.ok().flatten().unwrap_or_default();
-
-    // Derive instance suffix: explicit --name is validated, auto-derived names are sanitized.
-    let suffix = match cli.name {
-        Some(name) => {
-            let sanitized = sanitize_name(&name);
-            if sanitized != name {
-                eprintln!(
-                    "error: --name {name:?} contains invalid characters. \
-                     Use lowercase alphanumeric, hyphens, and underscores only (e.g. --name {sanitized:?})."
-                );
-                std::process::exit(1);
-            }
-            name
-        }
-        None => {
-            if !ble_name.is_empty() {
-                sanitize_name(&ble_name)
-            } else {
-                sanitize_name(&device.address().to_string())
-            }
-        }
-    };
-    let node_name = format!("atvvoice-{suffix}");
-    #[allow(unused_variables)]
-    let dbus_name = format!("org.atvvoice.{suffix}");
-    let node_description = cli.description.unwrap_or_else(|| {
-        if ble_name.is_empty() {
-            "ATVVoice Microphone".to_string()
-        } else {
-            ble_name.clone()
-        }
-    });
-
-    // State watch channel: atvv -> D-Bus (if enabled).
-    let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Init);
-
-    // Set up D-Bus control interface (if feature and CLI allow).
-    #[cfg(feature = "dbus")]
-    let (mut dbus_cmd_rx, _dbus_conn) = if !cli.no_dbus {
-        let info = dbus::DaemonInfo {
-            device_address: device_addr,
-            node_name: node_name.clone(),
-        };
-        match dbus::serve(_state_rx, info, &dbus_name).await {
-            Ok((cmd_rx, conn)) => (Some(cmd_rx), Some(conn)),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("already taken") || msg.contains("NameAlreadyOwned") || msg.contains("exists") {
-                    tracing::error!(
-                        "D-Bus name '{dbus_name}' is already in use. \
-                         Another ATVVoice instance may be running with the same name. \
-                         Use --name <suffix> to differentiate instances, or --no-dbus to disable."
-                    );
-                    std::process::exit(1);
-                }
-                tracing::warn!("Failed to register D-Bus interface: {e}");
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
+    let filter_addr: Option<bluer::Address> = cli.device.map(|s| s.parse()).transpose()?;
 
     // Set up signal handling for graceful shutdown.
     let ctrl_c = tokio::signal::ctrl_c();
@@ -225,104 +144,203 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         idle_timeout: std::time::Duration::from_secs(cli.idle_timeout),
     };
 
-    // Run ATVV session with reconnection loop.
-    // Channels and PipeWire thread are created per-session so the PW source
-    // disappears from audio settings when the device disconnects.
-    loop {
-        // Create per-session channels and audio pipeline.
-        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+    // Addresses to skip during auto-discovery (locked by another instance).
+    let mut excluded_addrs: Vec<bluer::Address> = Vec::new();
 
-        // PipeWire channel for clean shutdown signaling.
-        let (pw_shutdown_tx, pw_shutdown_rx) = pipewire::channel::channel::<pw::Shutdown>();
-
-        let pw_name = node_name.clone();
-        let pw_desc = node_description.clone();
-        let pw_thread = std::thread::spawn(move || {
-            if let Err(e) = pw::run_pw_source(pcm_rx, gain, &pw_name, &pw_desc, pw_shutdown_rx) {
-                tracing::error!("PipeWire error: {}", e);
-            }
-        });
-
-        let decoder_handle = tokio::spawn(async move {
-            while let Some(frame_data) = frame_rx.recv().await {
-                if frame_data.len() == adpcm::FRAME_SIZE {
-                    let frame: [u8; 134] = frame_data.try_into().unwrap();
-                    let (_seq, mut samples) = adpcm::decode_frame(&frame);
-                    adpcm::declip(&mut samples);
-                    adpcm::lowpass(&mut samples);
-                    let _ = pcm_tx.send(samples.to_vec());
+    // Outer loop: discover → connect → session. Restarts on lock errors in auto mode.
+    'discover: loop {
+        // Find ATVV device (retries until found)
+        let device = loop {
+            match ble::find_atvv_device(&adapter, filter_addr, &excluded_addrs).await {
+                Ok(device) => break device,
+                Err(e) => {
+                    tracing::info!("No ATVV device found ({e}), retrying in 5s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
-            }
-        });
-
-        let ble_device = ble::BluerDevice { device: &device, chars: &chars };
-        let session_result = tokio::select! {
-            result = atvv::run_session(
-                &ble_device,
-                frame_tx,
-                cli.mode,
-                &timeouts,
-                {
-                    #[cfg(feature = "dbus")]
-                    { dbus_cmd_rx.as_mut() }
-                    #[cfg(not(feature = "dbus"))]
-                    { None }
-                },
-                Some(&state_tx),
-            ) => result,
-            _ = &mut ctrl_c => {
-                // Send MIC_CLOSE on graceful shutdown
-                let _ = chars.tx.write(atvv::CMD_MIC_CLOSE).await;
-                tracing::info!("Sent MIC_CLOSE, shutting down");
-                // Signal PW thread to disconnect stream and quit cleanly.
-                let _ = pw_shutdown_tx.send(pw::Shutdown);
-                break;
             }
         };
 
-        // Session ended — signal PipeWire to disconnect stream cleanly (removes
-        // the node from audio settings), then wait for the thread to finish.
-        let _ = pw_shutdown_tx.send(pw::Shutdown);
-        decoder_handle.abort();
-        let _ = pw_thread.join();
-
-        match &session_result {
-            Ok(()) => tracing::info!("Session ended"),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("exclusive") || msg.contains("NotPermitted") || msg.contains("InProgress") {
-                    tracing::error!(
-                        "Device {} is already in use by another ATVVoice instance. \
-                         Only one instance can connect to a device at a time.",
-                        device.address()
-                    );
-                    std::process::exit(1);
-                }
-                tracing::warn!("Session error: {e}");
-            }
-        }
-
-        // Update D-Bus state
-        let _ = state_tx.send(atvv::State::Init);
-
-        // Wait for device to reconnect
         ensure_connected(&device).await;
-        tracing::info!("Device reconnected");
 
-        // Re-resolve characteristics (handles may change after reconnect)
-        chars = loop {
+        // Resolve GATT characteristics (retries on failure)
+        let mut chars = loop {
             match ble::resolve_chars(&device).await {
                 Ok(c) => {
-                    tracing::info!("ATVV characteristics re-resolved");
+                    tracing::info!("ATVV characteristics resolved");
                     break c;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to re-resolve characteristics ({e}), retrying in 2s...");
+                    tracing::warn!(
+                        "Failed to resolve characteristics ({e}), retrying in 2s..."
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
         };
+
+        // Derive instance names from device.
+        let ble_name = device.name().await.ok().flatten().unwrap_or_default();
+        let suffix = cli.name.clone().unwrap_or_else(|| {
+            if !ble_name.is_empty() {
+                sanitize_name(&ble_name)
+            } else {
+                sanitize_name(&device.address().to_string())
+            }
+        });
+        let node_name = format!("atvvoice-{suffix}");
+        #[allow(unused_variables)]
+        let dbus_name = format!("org.atvvoice.{suffix}");
+        let node_description = cli.description.clone().unwrap_or_else(|| {
+            if ble_name.is_empty() {
+                "ATVVoice Microphone".to_string()
+            } else {
+                ble_name.clone()
+            }
+        });
+
+        let gain = cli.gain;
+
+        // State watch channel: atvv -> D-Bus (if enabled).
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Init);
+
+        // Set up D-Bus control interface (if feature and CLI allow).
+        #[cfg(feature = "dbus")]
+        let (mut dbus_cmd_rx, _dbus_conn) = if !cli.no_dbus {
+            #[cfg(feature = "dbus")]
+            let device_addr = device.address().to_string();
+            let info = dbus::DaemonInfo {
+                device_address: device_addr,
+                node_name: node_name.clone(),
+            };
+            match dbus::serve(_state_rx, info, &dbus_name).await {
+                Ok((cmd_rx, conn)) => (Some(cmd_rx), Some(conn)),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already taken")
+                        || msg.contains("NameAlreadyOwned")
+                        || msg.contains("exists")
+                    {
+                        tracing::error!(
+                            "D-Bus name '{dbus_name}' is already in use. \
+                             Another ATVVoice instance may be running with the same name. \
+                             Use --name <suffix> to differentiate instances, or --no-dbus to disable."
+                        );
+                        std::process::exit(1);
+                    }
+                    tracing::warn!("Failed to register D-Bus interface: {e}");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        // Inner loop: session → reconnect (same device).
+        loop {
+            let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+            let (pw_shutdown_tx, pw_shutdown_rx) =
+                pipewire::channel::channel::<pw::Shutdown>();
+
+            let pw_name = node_name.clone();
+            let pw_desc = node_description.clone();
+            let pw_thread = std::thread::spawn(move || {
+                if let Err(e) =
+                    pw::run_pw_source(pcm_rx, gain, &pw_name, &pw_desc, pw_shutdown_rx)
+                {
+                    tracing::error!("PipeWire error: {}", e);
+                }
+            });
+
+            let decoder_handle = tokio::spawn(async move {
+                while let Some(frame_data) = frame_rx.recv().await {
+                    if frame_data.len() == adpcm::FRAME_SIZE {
+                        let frame: [u8; 134] = frame_data.try_into().unwrap();
+                        let (_seq, mut samples) = adpcm::decode_frame(&frame);
+                        adpcm::declip(&mut samples);
+                        adpcm::lowpass(&mut samples);
+                        let _ = pcm_tx.send(samples.to_vec());
+                    }
+                }
+            });
+
+            let ble_device = ble::BluerDevice {
+                device: &device,
+                chars: &chars,
+            };
+            let session_result = tokio::select! {
+                result = atvv::run_session(
+                    &ble_device,
+                    frame_tx,
+                    cli.mode,
+                    &timeouts,
+                    {
+                        #[cfg(feature = "dbus")]
+                        { dbus_cmd_rx.as_mut() }
+                        #[cfg(not(feature = "dbus"))]
+                        { None }
+                    },
+                    Some(&state_tx),
+                ) => result,
+                _ = &mut ctrl_c => {
+                    let _ = chars.tx.write(atvv::CMD_MIC_CLOSE).await;
+                    tracing::info!("Sent MIC_CLOSE, shutting down");
+                    let _ = pw_shutdown_tx.send(pw::Shutdown);
+                    break 'discover;
+                }
+            };
+
+            // Tear down audio pipeline.
+            let _ = pw_shutdown_tx.send(pw::Shutdown);
+            decoder_handle.abort();
+            let _ = pw_thread.join();
+
+            match &session_result {
+                Ok(()) => tracing::info!("Session ended"),
+                Err(e) if is_device_locked_error(e) => {
+                    if filter_addr.is_some() {
+                        // Explicit --device: fatal, user asked for this specific device.
+                        tracing::error!(
+                            "Device {} is already in use by another ATVVoice instance.",
+                            device.address()
+                        );
+                        std::process::exit(1);
+                    } else {
+                        // Auto mode: skip this device, try to find another.
+                        tracing::warn!(
+                            "Device {} is locked by another instance, looking for another device...",
+                            device.address()
+                        );
+                        excluded_addrs.push(device.address());
+                        continue 'discover;
+                    }
+                }
+                Err(e) => tracing::warn!("Session error: {e}"),
+            }
+
+            // Update D-Bus state
+            let _ = state_tx.send(atvv::State::Init);
+
+            // Wait for device to reconnect
+            ensure_connected(&device).await;
+            tracing::info!("Device reconnected");
+
+            // Re-resolve characteristics (handles may change after reconnect)
+            chars = loop {
+                match ble::resolve_chars(&device).await {
+                    Ok(c) => {
+                        tracing::info!("ATVV characteristics re-resolved");
+                        break c;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to re-resolve characteristics ({e}), retrying in 2s..."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            };
+        }
     }
 
     Ok(())

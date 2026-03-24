@@ -129,12 +129,17 @@ impl BleDevice for BluerDevice<'_> {
 
 /// Find a bonded device that advertises the ATVV service.
 /// If `filter_addr` is Some, only match that specific address.
+/// Addresses in `exclude` are skipped (e.g. devices locked by another instance).
 pub async fn find_atvv_device(
     adapter: &Adapter,
     filter_addr: Option<Address>,
+    exclude: &[Address],
 ) -> Result<Device> {
     // First check already-known devices
     for addr in adapter.device_addresses().await? {
+        if exclude.contains(&addr) {
+            continue;
+        }
         if let Some(filter) = filter_addr {
             if addr != filter {
                 continue;
@@ -159,6 +164,9 @@ pub async fn find_atvv_device(
     tokio::pin!(discover);
     while let Some(evt) = discover.next().await {
         if let AdapterEvent::DeviceAdded(addr) = evt {
+            if exclude.contains(&addr) {
+                continue;
+            }
             if let Some(filter) = filter_addr {
                 if addr != filter {
                     continue;
