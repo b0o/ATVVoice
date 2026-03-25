@@ -55,6 +55,15 @@ sudo dpkg -i atvvoice_*_arm64.deb   # aarch64
 
 This installs a systemd user service. See [Systemd service](#systemd-service) for setup.
 
+### Fedora (COPR)
+
+```bash
+sudo dnf copr enable maddison-io/ATVVoice
+sudo dnf install atvvoice
+```
+
+Available for Fedora 42+ on x86_64 and aarch64. This installs a systemd user service. See [Systemd service](#systemd-service) for setup.
+
 ### Fedora/RHEL (.rpm)
 
 Download the `.rpm` package for your architecture from the [latest release](https://github.com/b0o/atvvoice/releases/latest):

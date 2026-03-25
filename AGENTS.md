@@ -238,6 +238,13 @@ nix build                                                                 # Nix 
 - Builds `x86_64-linux` and `aarch64-linux` binaries via Nix (aarch64 uses QEMU)
 - Creates GitHub release with binaries and auto-generated release notes
 
+**COPR** (`.github/workflows/copr.yml`): Triggered on release publish and manual dispatch.
+
+- Runs in `fedora:latest` container
+- `packaging/rpm/build-srpm.sh` creates SRPM with vendored Cargo deps
+- `copr-cli build` submits to Fedora COPR for Fedora 42/43/44 (x86_64, aarch64)
+- Secrets: `COPR_API_LOGIN`, `COPR_API_TOKEN` from copr.fedorainfracloud.org
+
 ### Release process
 
 1. Bump version in `Cargo.toml`
