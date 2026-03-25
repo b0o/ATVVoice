@@ -1,6 +1,6 @@
 [package]
 name = "atvvoice"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Android TV Voice over BLE (ATVV) daemon for Linux/PipeWire"
 license = "MIT"
