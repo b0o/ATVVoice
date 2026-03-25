@@ -44,6 +44,28 @@ nixpkgs.overlays = [ inputs.atvvoice.overlays.default ];
 # then: pkgs.atvvoice
 ```
 
+### Debian/Ubuntu (.deb)
+
+Download the `.deb` package for your architecture from the [latest release](https://github.com/b0o/atvvoice/releases/latest):
+
+```bash
+sudo dpkg -i atvvoice_*_amd64.deb   # x86_64
+sudo dpkg -i atvvoice_*_arm64.deb   # aarch64
+```
+
+This installs a systemd user service. See [Systemd service](#systemd-service) for setup.
+
+### Fedora/RHEL (.rpm)
+
+Download the `.rpm` package for your architecture from the [latest release](https://github.com/b0o/atvvoice/releases/latest):
+
+```bash
+sudo rpm -i atvvoice-*.x86_64.rpm    # x86_64
+sudo rpm -i atvvoice-*.aarch64.rpm   # aarch64
+```
+
+This installs a systemd user service. See [Systemd service](#systemd-service) for setup.
+
 ### Cargo
 
 ```
@@ -85,6 +107,30 @@ atvvoice -d 11:22:33:44:55:66 --name office &
 ```
 
 This creates PW nodes `atvvoice-living-room` / `atvvoice-office` and D-Bus names `org.atvvoice.living-room` / `org.atvvoice.office`.
+
+## Systemd service
+
+The Linux packages include a systemd user service. If you installed via Cargo or a bare binary, you can grab the [service file](dist/atvvoice.service) directly and install it to `~/.config/systemd/user/`. Enable it after installation:
+
+```bash
+systemctl --user enable --now atvvoice
+```
+
+By default, the service runs `atvvoice` with no arguments, which auto-detects the first ATVV device. To customize options (e.g., set a specific device address or gain), create a drop-in override:
+
+```bash
+systemctl --user edit atvvoice
+```
+
+Then add:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/atvvoice --device AA:BB:CC:DD:EE:FF --gain 25
+```
+
+Note: The blank `ExecStart=` line is required. It clears the default command before setting a new one. Without it, systemd runs both the original and your custom command.
 
 ## Home Manager options
 

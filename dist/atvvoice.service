@@ -1,0 +1,12 @@
+[Unit]
+Description=ATVVoice - BLE voice remote microphone daemon
+After=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/atvvoice
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

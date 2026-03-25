@@ -41,18 +41,32 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
       - name: Build
         run: cargo build --release --locked
 
-      - name: Package artifact
+      - name: Build .deb package
+        run: cargo deb --no-build
+
+      - name: Build .rpm package
+        run: cargo generate-rpm
+
+      - name: Package artifacts
         run: |
           cp target/release/atvvoice ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
+          cp target/debian/*.deb .
+          cp target/generate-rpm/*.rpm .
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            *.deb
+            *.rpm
 
   release:
     needs: build
@@ -80,3 +94,5 @@ jobs:
           files: |
             atvvoice-x86_64-linux
             atvvoice-aarch64-linux
+            *.deb
+            *.rpm
