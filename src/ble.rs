@@ -1,3 +1,5 @@
+//! BLE device discovery and ATVV GATT characteristic resolution.
+
 use std::pin::Pin;
 
 use anyhow::{Context, Result};
@@ -13,7 +15,10 @@ fn reader_to_stream(
     Box::pin(futures::stream::unfold(reader, |reader| async move {
         match reader.recv().await {
             Ok(data) => Some((data, reader)),
-            Err(_) => None, // FD closed (device disconnected)
+            Err(e) => {
+                tracing::debug!("BLE notification stream ended: {e}");
+                None
+            }
         }
     }))
 }
@@ -35,6 +40,16 @@ pub struct AtvvChars {
     pub tx: Characteristic,
     pub rx: Characteristic,
     pub ctl: Characteristic,
+}
+
+impl std::fmt::Debug for AtvvChars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtvvChars")
+            .field("tx", &"<Characteristic>")
+            .field("rx", &"<Characteristic>")
+            .field("ctl", &"<Characteristic>")
+            .finish()
+    }
 }
 
 /// Real BLE device implementation wrapping bluer types.
@@ -94,6 +109,19 @@ impl BleDevice for BluerDevice<'_> {
     }
 }
 
+/// Returns `true` if the given address should be skipped during discovery.
+fn should_skip(addr: Address, filter_addr: Option<Address>, excluded: &[Address]) -> bool {
+    if excluded.contains(&addr) {
+        return true;
+    }
+    if let Some(filter) = filter_addr {
+        if addr != filter {
+            return true;
+        }
+    }
+    false
+}
+
 /// Find a bonded device that advertises the ATVV service.
 /// If `filter_addr` is Some, only match that specific address.
 /// Addresses in `exclude` are skipped (e.g. devices locked by another instance).
@@ -104,20 +132,15 @@ pub async fn find_atvv_device(
 ) -> Result<Device> {
     // First check already-known devices
     for addr in adapter.device_addresses().await? {
-        if exclude.contains(&addr) {
+        if should_skip(addr, filter_addr, exclude) {
             continue;
-        }
-        if let Some(filter) = filter_addr {
-            if addr != filter {
-                continue;
-            }
         }
         let device = adapter.device(addr)?;
         if let Ok(Some(uuids)) = device.uuids().await {
             if uuids.contains(&ATVV_SERVICE) {
                 tracing::info!(
                     "Found ATVV device: {} ({})",
-                    device.name().await?.unwrap_or_default(),
+                    device.name().await.ok().flatten().unwrap_or_default(),
                     addr
                 );
                 return Ok(device);
@@ -131,13 +154,8 @@ pub async fn find_atvv_device(
     tokio::pin!(discover);
     while let Some(evt) = discover.next().await {
         if let AdapterEvent::DeviceAdded(addr) = evt {
-            if exclude.contains(&addr) {
+            if should_skip(addr, filter_addr, exclude) {
                 continue;
-            }
-            if let Some(filter) = filter_addr {
-                if addr != filter {
-                    continue;
-                }
             }
             let device = adapter.device(addr)?;
             if let Ok(Some(uuids)) = device.uuids().await {
@@ -149,7 +167,7 @@ pub async fn find_atvv_device(
         }
     }
 
-    anyhow::bail!("No ATVV device found")
+    anyhow::bail!("BLE discovery stream ended without finding an ATVV device (adapter may have been removed)")
 }
 
 /// Resolve the three ATVV GATT characteristics from a connected device.
@@ -171,6 +189,7 @@ pub async fn resolve_chars(device: &Device) -> Result<AtvvChars> {
                 _ => {}
             }
         }
+        break; // Found the ATVV service; no need to check other services.
     }
 
     Ok(AtvvChars {

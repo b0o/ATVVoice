@@ -1,18 +1,11 @@
+//! ATVV v1.0 protocol implementation.
+
 use anyhow::Result;
 
 use super::types::*;
 use super::Protocol;
 use crate::adpcm::AdpcmDecoder;
 
-/// ATVV v1.0 protocol implementation.
-///
-/// Key differences from v0.4:
-/// - GET_CAPS includes interaction model support
-/// - MIC_OPEN takes audio_mode, not codec
-/// - MIC_CLOSE and MIC_EXTEND include stream_id
-/// - AUDIO_START/STOP/SYNC have payloads (reason, codec, stream_id, decoder state)
-/// - Audio frames are headerless (decoder state persists, reset via AUDIO_SYNC)
-///
 // v1.0 CTL payload minimum lengths (including opcode byte).
 const AUDIO_START_MIN_LEN: usize = 4; // opcode + reason(1) + codec(1) + stream_id(1)
 const AUDIO_SYNC_MIN_LEN: usize = 7; // opcode + codec(1) + frame_num(2) + predictor(2) + step_index(1)
@@ -27,6 +20,8 @@ pub(crate) fn parse_caps_resp_payload(data: &[u8]) -> Option<Capabilities> {
         return None;
     }
     let version_wire = u16::from_be_bytes([data[1], data[2]]);
+    // Defensive default: if the wire version is unrecognized, assume v1.0
+    // for forward-compatibility with future protocol versions.
     let version = ProtocolVersion::from_wire(version_wire).unwrap_or(ProtocolVersion::V1_0);
     let codecs = Codecs::from_bits_truncate(data[3]);
     let interaction_model =
@@ -40,6 +35,11 @@ pub(crate) fn parse_caps_resp_payload(data: &[u8]) -> Option<Capabilities> {
     })
 }
 
+/// ATVV v1.0 protocol implementation.
+///
+/// Supports Push-to-Talk (PTT) and Hold-to-Talk (HTT) interaction models
+/// in addition to the v0.4 OnRequest model. Audio frames are headerless —
+/// decoder state persists across frames and resets only via AUDIO_SYNC.
 pub struct ProtocolV10 {
     pub(crate) selected_codec: Option<Codec>,
     pub(crate) interaction_model: InteractionModel,
@@ -192,6 +192,12 @@ impl Protocol for ProtocolV10 {
                 self.selected_codec = Some(*codec);
             }
             AudioSyncData::FrameNum { seq } => {
+                // Unexpected in v1.0 (v1.0 uses Full sync with decoder state),
+                // but handle gracefully by updating frame sequence only.
+                tracing::trace!(
+                    seq,
+                    "v1.0 AUDIO_SYNC: FrameNum-only (unexpected, v1.0 normally uses Full)"
+                );
                 self.frame_seq = *seq;
             }
         }
@@ -351,8 +357,8 @@ mod tests {
             step_index: 30,
         };
         p.on_audio_sync(&sync);
-        assert_eq!(p.decoder.predictor, 500);
-        assert_eq!(p.decoder.step_index, 30);
+        assert_eq!(p.decoder.predictor(), 500);
+        assert_eq!(p.decoder.step_index(), 30);
         assert_eq!(p.frame_seq, 42);
     }
 
@@ -391,5 +397,96 @@ mod tests {
     fn test_parse_caps_resp_payload_too_short() {
         let data: &[u8] = &[0x0B, 0x01, 0x00];
         assert!(parse_caps_resp_payload(data).is_none());
+    }
+
+    // ── on_caps_resp tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_on_caps_resp_selects_16khz_when_both() {
+        let mut p = ProtocolV10::new();
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(128),
+        };
+        let codec = p.on_caps_resp(&caps).unwrap();
+        assert_eq!(codec, Codec::Adpcm16kHz);
+        assert_eq!(p.selected_codec, Some(Codec::Adpcm16kHz));
+        assert_eq!(p.interaction_model, InteractionModel::HoldToTalk);
+        assert_eq!(p.audio_frame_size, AudioFrameSize(128));
+    }
+
+    #[test]
+    fn test_on_caps_resp_8khz_only() {
+        let mut p = ProtocolV10::new();
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::PressToTalk,
+            audio_frame_size: AudioFrameSize(20),
+        };
+        let codec = p.on_caps_resp(&caps).unwrap();
+        assert_eq!(codec, Codec::Adpcm8kHz);
+        assert_eq!(p.interaction_model, InteractionModel::PressToTalk);
+    }
+
+    #[test]
+    fn test_on_caps_resp_no_common_codec() {
+        let mut p = ProtocolV10::new();
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::empty(),
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(20),
+        };
+        assert!(p.on_caps_resp(&caps).is_err());
+    }
+
+    #[test]
+    fn test_on_caps_resp_updates_frame_size() {
+        let mut p = ProtocolV10::new();
+        assert_eq!(p.audio_frame_size, AudioFrameSize::DEFAULT_V10);
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(160),
+        };
+        p.on_caps_resp(&caps).unwrap();
+        assert_eq!(p.audio_frame_size, AudioFrameSize(160));
+    }
+
+    // ── Additional edge case tests ──────────────────────────────────
+
+    #[test]
+    fn test_decode_audio_wrong_size() {
+        let mut p = ProtocolV10::new();
+        p.selected_codec = Some(Codec::Adpcm8kHz);
+        p.audio_frame_size = AudioFrameSize(20);
+        // 10 bytes != expected 20
+        assert!(p.decode_audio(&[0u8; 10]).is_none());
+        // 30 bytes != expected 20
+        assert!(p.decode_audio(&[0u8; 30]).is_none());
+        // 0 bytes
+        assert!(p.decode_audio(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_ctl() {
+        let p = ProtocolV10::new();
+        match p.parse_ctl(&[]) {
+            CtlEvent::Unknown(data) => assert!(data.is_empty()),
+            other => panic!("expected Unknown for empty CTL, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_unknown_opcode() {
+        let p = ProtocolV10::new();
+        match p.parse_ctl(&[0xFF, 0x01, 0x02]) {
+            CtlEvent::Unknown(data) => assert_eq!(data, vec![0xFF, 0x01, 0x02]),
+            other => panic!("expected Unknown for unknown opcode, got {:?}", other),
+        }
     }
 }

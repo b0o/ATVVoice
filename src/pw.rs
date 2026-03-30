@@ -28,6 +28,7 @@ const CHANNELS: u32 = 1;
 const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 
 /// Signal to shut down the PipeWire source cleanly.
+#[derive(Debug)]
 pub struct Shutdown;
 
 /// Run the PipeWire audio source on the current thread (blocking).
@@ -86,24 +87,40 @@ pub fn run_pw_source(
     // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
     let pending: std::cell::RefCell<Vec<i16>> = std::cell::RefCell::new(Vec::new());
 
+    // Precompute linear gain multiplier outside the RT callback to avoid
+    // recomputing powf() on every frame.
+    let gain_linear = 10f32.powf(gain_db / 20.0);
+
+    /// Maximum pending samples before overflow truncation (~500ms at 16kHz).
+    const MAX_PENDING: usize = 8000;
+
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed(|_, _, old, new| {
             tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
         })
         .process(move |stream: &Stream, _| {
-            {
-                let mut buf = pending.borrow_mut();
-                loop {
-                    match audio_rx.try_recv() {
-                        Ok(mut frame) => {
-                            crate::adpcm::apply_gain(&mut frame, gain_db);
-                            buf.extend_from_slice(&frame);
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => break,
+            // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
+            // At ~30 fps with 257 samples/frame, allocation pressure is negligible
+            // and not a real-time concern for voice audio rates.
+            let mut buf = pending.borrow_mut();
+
+            loop {
+                match audio_rx.try_recv() {
+                    Ok(mut frame) => {
+                        crate::adpcm::apply_gain_linear(&mut frame, gain_linear);
+                        buf.extend_from_slice(&frame);
                     }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
+            }
+
+            // Bound pending buffer to prevent unbounded growth under backpressure.
+            if buf.len() > MAX_PENDING {
+                let dropped = buf.len() - MAX_PENDING;
+                buf.drain(..dropped);
+                tracing::warn!("audio buffer overflow: dropped {dropped} samples");
             }
 
             let Some(mut pw_buf) = stream.dequeue_buffer() else {
@@ -127,21 +144,21 @@ pub fn run_pw_source(
                 buf_capacity
             };
 
-            let mut buf = pending.borrow_mut();
             let available = buf.len().min(max_samples);
 
-            for (i, &sample) in buf.iter().take(available).enumerate() {
-                let bytes = sample.to_le_bytes();
-                let offset = i * SAMPLE_SIZE;
-                slice[offset] = bytes[0];
-                slice[offset + 1] = bytes[1];
+            // Copy i16 samples to the output buffer as little-endian bytes.
+            for (src, dst) in buf
+                .iter()
+                .take(available)
+                .zip(slice.chunks_exact_mut(SAMPLE_SIZE))
+            {
+                dst.copy_from_slice(&src.to_le_bytes());
             }
 
+            // Zero remaining buffer bytes (silence).
             let silence_start = available * SAMPLE_SIZE;
             let silence_end = max_samples * SAMPLE_SIZE;
-            for byte in &mut slice[silence_start..silence_end] {
-                *byte = 0;
-            }
+            slice[silence_start..silence_end].fill(0);
 
             if available > 0 {
                 buf.drain(..available);

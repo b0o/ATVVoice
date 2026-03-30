@@ -1,3 +1,5 @@
+//! IMA/DVI ADPCM audio decoder with post-processing pipeline.
+
 /// IMA/DVI ADPCM step size table (89 entries).
 const STEP_TABLE: [i32; 89] = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
@@ -11,10 +13,12 @@ const STEP_TABLE: [i32; 89] = [
 const INDEX_TABLE: [i32; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];
 
 /// ATVV audio frame size in bytes.
+#[cfg(test)]
 pub const FRAME_SIZE: usize = 134;
 
 /// Number of PCM samples decoded from one frame.
 /// 1 (predictor) + 256 (128 bytes × 2 nibbles).
+#[cfg(test)]
 pub const SAMPLES_PER_FRAME: usize = 257;
 
 /// Maximum valid step table index (STEP_TABLE has 89 entries, indexed 0..=88).
@@ -24,15 +28,27 @@ const MAX_STEP_INDEX: u8 = 88;
 ///
 /// Used by Protocol implementations. State can be reset per-frame (v0.4)
 /// or persist across frames with periodic AUDIO_SYNC resets (v1.0).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct AdpcmDecoder {
-    pub predictor: i16,
-    pub step_index: u8,
+    predictor: i16,
+    step_index: u8,
 }
 
 impl AdpcmDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Current predictor value.
+    #[cfg(test)]
+    pub fn predictor(&self) -> i16 {
+        self.predictor
+    }
+
+    /// Current step table index (0..=88).
+    #[cfg(test)]
+    pub fn step_index(&self) -> u8 {
+        self.step_index
     }
 
     /// Reset decoder state. Step index is clamped to 0..=88.
@@ -42,7 +58,9 @@ impl AdpcmDecoder {
     }
 
     /// Decode a single 4-bit ADPCM nibble. Updates internal state.
+    #[inline]
     pub fn decode_nibble(&mut self, nibble: u8) -> i16 {
+        debug_assert!(nibble <= 0x0F);
         let step = STEP_TABLE[self.step_index as usize];
         let mut diff = step >> 3;
         if nibble & 1 != 0 {
@@ -72,13 +90,33 @@ impl AdpcmDecoder {
         self.predictor
     }
 
-    /// Decode ADPCM bytes (high nibble first). Returns 2 samples per byte.
-    pub fn decode_bytes(&mut self, data: &[u8]) -> Vec<i16> {
-        let mut samples = Vec::with_capacity(data.len() * 2);
+    /// Decode ADPCM bytes into a caller-provided slice (high nibble first).
+    /// Returns the number of samples written. Each byte produces 2 samples,
+    /// so max output is `data.len() * 2` (capped by `out.len()`).
+    pub fn decode_into(&mut self, data: &[u8], out: &mut [i16]) -> usize {
+        let mut written = 0;
         for &byte in data {
-            samples.push(self.decode_nibble(byte >> 4));
-            samples.push(self.decode_nibble(byte & 0x0F));
+            if written >= out.len() {
+                break;
+            }
+            out[written] = self.decode_nibble(byte >> 4);
+            written += 1;
+            if written >= out.len() {
+                break;
+            }
+            out[written] = self.decode_nibble(byte & 0x0F);
+            written += 1;
         }
+        written
+    }
+
+    /// Decode ADPCM bytes (high nibble first). Returns 2 samples per byte.
+    ///
+    /// Convenience wrapper around [`decode_into`](Self::decode_into).
+    pub fn decode_bytes(&mut self, data: &[u8]) -> Vec<i16> {
+        let mut samples = vec![0i16; data.len() * 2];
+        let n = self.decode_into(data, &mut samples);
+        samples.truncate(n);
         samples
     }
 }
@@ -96,6 +134,8 @@ impl AdpcmDecoder {
 ///
 /// This is a convenience wrapper around `AdpcmDecoder` that preserves
 /// the original API. Use `AdpcmDecoder` directly for v1.0 headerless frames.
+#[cfg(test)]
+#[must_use]
 pub fn decode_frame(frame: &[u8; FRAME_SIZE]) -> (u16, [i16; SAMPLES_PER_FRAME]) {
     let seq = u16::from_be_bytes([frame[0], frame[1]]);
     let predictor = i16::from_be_bytes([frame[3], frame[4]]);
@@ -105,10 +145,10 @@ pub fn decode_frame(frame: &[u8; FRAME_SIZE]) -> (u16, [i16; SAMPLES_PER_FRAME])
     decoder.reset(predictor, step_index);
 
     let mut samples = [0i16; SAMPLES_PER_FRAME];
-    samples[0] = decoder.predictor;
+    samples[0] = decoder.predictor();
 
-    let decoded = decoder.decode_bytes(&frame[6..]);
-    samples[1..].copy_from_slice(&decoded);
+    // Decode ADPCM nibbles directly into the output array (no intermediate Vec)
+    decoder.decode_into(&frame[6..], &mut samples[1..]);
 
     (seq, samples)
 }
@@ -136,6 +176,11 @@ pub fn declip(samples: &mut [i16]) {
 ///
 /// Note: first and last samples pass through unfiltered. This is intentional
 /// for per-frame processing - the predictor at sample[0] provides continuity.
+///
+/// // IMPORTANT: This filter operates in-place left-to-right. The `prev` variable
+/// // holds the ORIGINAL (unfiltered) value of `samples[i-1]`, NOT the already-written
+/// // filtered value. This is deliberate: `prev = cur` captures the unfiltered sample
+/// // before it gets overwritten, giving true FIR behavior rather than IIR feedback.
 pub fn lowpass(samples: &mut [i16]) {
     if samples.len() < 3 {
         return;
@@ -150,13 +195,26 @@ pub fn lowpass(samples: &mut [i16]) {
     }
 }
 
-/// Apply fixed gain (in dB) with clamping.
-pub fn apply_gain(samples: &mut [i16], gain_db: f32) {
-    let gain = 10f32.powf(gain_db / 20.0);
+/// Apply gain using a precomputed linear multiplier with clamping.
+///
+/// Use this on hot paths where the same gain is applied to many frames.
+/// Compute the linear value once with `10f32.powf(gain_db / 20.0)`.
+pub fn apply_gain_linear(samples: &mut [i16], gain_linear: f32) {
     for s in samples.iter_mut() {
-        let amplified = (*s as f32 * gain).round() as i32;
+        let amplified = (*s as f32 * gain_linear).round() as i32;
         *s = amplified.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     }
+}
+
+/// Apply fixed gain (in dB) with clamping.
+///
+/// Convenience wrapper around [`apply_gain_linear`] that computes the linear
+/// multiplier from dB. For repeated calls with the same gain, prefer
+/// precomputing the linear value and calling [`apply_gain_linear`] directly.
+#[cfg(test)]
+pub fn apply_gain(samples: &mut [i16], gain_db: f32) {
+    let gain = 10f32.powf(gain_db / 20.0);
+    apply_gain_linear(samples, gain);
 }
 
 #[cfg(test)]
@@ -600,15 +658,15 @@ mod tests {
     fn test_decoder_reset() {
         let mut dec = AdpcmDecoder::new();
         dec.reset(1000, 40);
-        assert_eq!(dec.predictor, 1000);
-        assert_eq!(dec.step_index, 40);
+        assert_eq!(dec.predictor(), 1000);
+        assert_eq!(dec.step_index(), 40);
     }
 
     #[test]
     fn test_decoder_step_index_clamped() {
         let mut dec = AdpcmDecoder::new();
         dec.reset(0, 100); // 100 > 88, should clamp
-        assert_eq!(dec.step_index, 88);
+        assert_eq!(dec.step_index(), 88);
     }
 
     #[test]

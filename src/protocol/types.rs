@@ -1,6 +1,7 @@
-// Wire protocol types for ATVV v0.4 and v1.0.
-// All types use strong typing: repr(u8) enums with num_enum derives,
-// bitflags for codec bitmasks, newtypes for stream IDs and frame sizes.
+//! Wire protocol types for ATVV v0.4 and v1.0.
+//!
+//! All types use strong typing: repr(u8) enums with num_enum derives,
+//! bitflags for codec bitmasks, newtypes for stream IDs and frame sizes.
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
@@ -21,7 +22,8 @@ impl std::fmt::Display for ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// Parse a version string like "0.4" or "1.0".
+    /// Parses a version string like "0.4" or "1.0". Returns String error for clap compatibility.
+    #[cfg(test)]
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "0.4" => Ok(Self::V0_4),
@@ -101,16 +103,17 @@ bitflags::bitflags! {
 
 /// Audio frame size in bytes (from CAPS_RESP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioFrameSize(pub u16);
+pub struct AudioFrameSize(pub(crate) u16);
 
 impl AudioFrameSize {
     pub const DEFAULT_V04: Self = Self(134); // 6-byte header + 128 ADPCM
-    pub const DEFAULT_V10: Self = Self(20); // default notification payload
+    /// Minimum/default frame size from the v1.0 spec (default BLE notification payload).
+    pub const DEFAULT_V10: Self = Self(20);
 }
 
 /// Stream identifier. Race-condition guard, not multiplexing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamId(pub u8);
+pub struct StreamId(pub(crate) u8);
 
 impl StreamId {
     /// Stream initiated by MIC_OPEN.
@@ -132,8 +135,10 @@ pub enum InteractionModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum AudioMode {
-    Playback = 0x00, // realtime, reduced buffer
-    Capture = 0x01,  // non-realtime, larger buffer
+    /// Realtime, reduced buffer.
+    Playback = 0x00,
+    /// Non-realtime, larger buffer.
+    Capture = 0x01,
 }
 
 /// Reason for AUDIO_START (v1.0 payload; v0.4 synthesizes MicOpen).
@@ -148,11 +153,17 @@ pub enum AudioStartReason {
 /// Reason for AUDIO_STOP. Hand-written From<u8> for catch-all variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioStopReason {
-    MicClose,              // 0x00
-    HttButtonRelease,      // 0x02
-    UpcomingAudioStart,    // 0x04
-    TransferTimeout,       // 0x08
-    NotificationsDisabled, // 0x10
+    /// 0x00
+    MicClose,
+    /// 0x02
+    HttButtonRelease,
+    /// 0x04
+    UpcomingAudioStart,
+    /// 0x08
+    TransferTimeout,
+    /// 0x10
+    NotificationsDisabled,
+    /// Unknown/other reason code.
     Other(u8),
 }
 
@@ -172,11 +183,17 @@ impl From<u8> for AudioStopReason {
 /// MIC_OPEN error code. Hand-written From<u16> for catch-all variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicOpenErrorCode {
-    InvalidCodec,          // 0x0F01
-    RemoteNotActive,       // 0x0F02
-    NotificationsDisabled, // 0x0F03
-    PttHttInProgress,      // 0x0F80
-    InternalError,         // 0x0FFF
+    /// 0x0F01
+    InvalidCodec,
+    /// 0x0F02
+    RemoteNotActive,
+    /// 0x0F03
+    NotificationsDisabled,
+    /// 0x0F80
+    PttHttInProgress,
+    /// 0x0FFF
+    InternalError,
+    /// Unknown/other error code.
     Unknown(u16),
 }
 
@@ -395,5 +412,33 @@ mod tests {
     fn test_audio_mode() {
         assert_eq!(u8::from(AudioMode::Playback), 0x00);
         assert_eq!(u8::from(AudioMode::Capture), 0x01);
+    }
+
+    #[test]
+    fn test_protocol_version_display() {
+        assert_eq!(format!("{}", ProtocolVersion::V0_4), "v0.4");
+        assert_eq!(format!("{}", ProtocolVersion::V1_0), "v1.0");
+    }
+
+    #[test]
+    fn test_protocol_version_wire_roundtrip() {
+        // V0_4 roundtrip
+        let wire_04 = ProtocolVersion::V0_4.wire_value();
+        assert_eq!(wire_04, 0x0004);
+        assert_eq!(
+            ProtocolVersion::from_wire(wire_04),
+            Some(ProtocolVersion::V0_4)
+        );
+
+        // V1_0 roundtrip
+        let wire_10 = ProtocolVersion::V1_0.wire_value();
+        assert_eq!(wire_10, 0x0100);
+        assert_eq!(
+            ProtocolVersion::from_wire(wire_10),
+            Some(ProtocolVersion::V1_0)
+        );
+
+        // Unknown wire value
+        assert_eq!(ProtocolVersion::from_wire(0xFFFF), None);
     }
 }

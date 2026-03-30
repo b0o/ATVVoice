@@ -1,3 +1,5 @@
+//! ATVV v0.4 protocol implementation.
+
 use anyhow::Result;
 
 use super::types::*;
@@ -47,6 +49,13 @@ pub(crate) fn parse_caps_resp_payload(data: &[u8]) -> Option<Capabilities> {
     }
     let codecs = Codecs::from_bits_truncate(data[4]);
     let frame_size = u16::from_be_bytes([data[5], data[6]]);
+    if (frame_size as usize) < FRAME_HEADER_SIZE {
+        tracing::warn!(
+            frame_size,
+            min = FRAME_HEADER_SIZE,
+            "v0.4 CAPS_RESP: frame_size smaller than header size"
+        );
+    }
     Some(Capabilities {
         version,
         codecs,
@@ -81,6 +90,7 @@ impl Protocol for ProtocolV04 {
 
     fn keepalive_cmd(&self, _stream_id: StreamId) -> Vec<u8> {
         // v0.4: no MIC_EXTEND, fall back to MIC_OPEN
+        tracing::debug!("v0.4 keepalive: re-sending MIC_OPEN (no MIC_EXTEND support)");
         self.mic_open_cmd()
     }
 
@@ -144,6 +154,9 @@ impl Protocol for ProtocolV04 {
         if data.len() != expected {
             return None;
         }
+        // Defense-in-depth: the BLE MTU should guarantee full frames and the
+        // size check above should catch short data, but we verify the header
+        // fits anyway to guard against misconfigured audio_frame_size.
         if data.len() < FRAME_HEADER_SIZE {
             return None;
         }
@@ -177,8 +190,12 @@ impl Protocol for ProtocolV04 {
         // v0.4: just note the frame number for gap detection
         // (no decoder state in v0.4 AUDIO_SYNC)
         match sync {
-            AudioSyncData::FrameNum { .. } => {}
-            AudioSyncData::Full { .. } => {}
+            AudioSyncData::FrameNum { seq } => {
+                tracing::trace!(seq, "v0.4 AUDIO_SYNC: frame number");
+            }
+            AudioSyncData::Full { .. } => {
+                tracing::warn!("v0.4 AUDIO_SYNC: unexpected Full sync data (v0.4 should only produce FrameNum)");
+            }
         }
     }
 }
@@ -373,5 +390,26 @@ mod tests {
     fn test_parse_caps_resp_payload_too_short() {
         let data: &[u8] = &[0x0B, 0x00, 0x04];
         assert!(parse_caps_resp_payload(data).is_none());
+    }
+
+    #[test]
+    fn test_parse_ctl_empty() {
+        let p = ProtocolV04::new();
+        match p.parse_ctl(&[]) {
+            CtlEvent::Unknown(data) => assert!(data.is_empty()),
+            other => panic!("expected Unknown for empty CTL, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_on_caps_resp_no_common_codec() {
+        let mut p = ProtocolV04::new();
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::empty(), // no codecs supported
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
+        assert!(p.on_caps_resp(&caps).is_err());
     }
 }

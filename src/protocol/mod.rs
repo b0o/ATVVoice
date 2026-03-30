@@ -59,6 +59,7 @@ pub(crate) fn negotiate_codec(remote_codecs: types::Codecs) -> Result<types::Cod
 const SUPPORTED_INTERACTION_MODELS: u8 = 0x03;
 
 /// Build a GET_CAPS command advertising our maximum supported version (v1.0).
+#[must_use]
 pub fn get_caps_cmd() -> Vec<u8> {
     let ver = types::ProtocolVersion::V1_0.wire_value().to_be_bytes();
     let codecs = (types::Codecs::ADPCM_8KHZ | types::Codecs::ADPCM_16KHZ).bits();
@@ -91,13 +92,17 @@ pub fn parse_caps_resp(data: &[u8]) -> Option<types::Capabilities> {
 }
 
 /// Create a Protocol already initialized with negotiated capabilities.
-pub fn create_protocol(caps: &Capabilities) -> Result<Box<dyn Protocol>> {
+///
+/// Returns the protocol implementation and the negotiated codec. The codec is
+/// returned here because `on_caps_resp` already performs negotiation internally,
+/// avoiding the need for callers to call `negotiate_codec` separately.
+pub fn create_protocol(caps: &Capabilities) -> Result<(Box<dyn Protocol>, Codec)> {
     let mut p: Box<dyn Protocol> = match caps.version {
         ProtocolVersion::V0_4 => Box::new(v04::ProtocolV04::new()),
         ProtocolVersion::V1_0 => Box::new(v10::ProtocolV10::new()),
     };
-    p.on_caps_resp(caps)?;
-    Ok(p)
+    let codec = p.on_caps_resp(caps)?;
+    Ok((p, codec))
 }
 
 #[cfg(test)]
@@ -165,8 +170,9 @@ mod tests {
             interaction_model: types::InteractionModel::OnRequest,
             audio_frame_size: types::AudioFrameSize(134),
         };
-        let p = create_protocol(&caps).unwrap();
+        let (p, codec) = create_protocol(&caps).unwrap();
         assert_eq!(p.version(), types::ProtocolVersion::V0_4);
+        assert_eq!(codec, types::Codec::Adpcm8kHz);
     }
 
     #[test]
@@ -177,7 +183,30 @@ mod tests {
             interaction_model: types::InteractionModel::HoldToTalk,
             audio_frame_size: types::AudioFrameSize(128),
         };
-        let p = create_protocol(&caps).unwrap();
+        let (p, codec) = create_protocol(&caps).unwrap();
         assert_eq!(p.version(), types::ProtocolVersion::V1_0);
+        assert_eq!(codec, types::Codec::Adpcm16kHz);
+    }
+
+    // ── negotiate_codec tests ───────────────────────────────────────
+
+    #[test]
+    fn test_negotiate_codec_prefers_16khz() {
+        let remote = types::Codecs::ADPCM_8KHZ | types::Codecs::ADPCM_16KHZ;
+        let codec = negotiate_codec(remote).unwrap();
+        assert_eq!(codec, types::Codec::Adpcm16kHz);
+    }
+
+    #[test]
+    fn test_negotiate_codec_falls_back_to_8khz() {
+        let remote = types::Codecs::ADPCM_8KHZ;
+        let codec = negotiate_codec(remote).unwrap();
+        assert_eq!(codec, types::Codec::Adpcm8kHz);
+    }
+
+    #[test]
+    fn test_negotiate_codec_no_common_codec() {
+        let remote = types::Codecs::empty();
+        assert!(negotiate_codec(remote).is_err());
     }
 }
