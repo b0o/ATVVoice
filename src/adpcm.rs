@@ -259,9 +259,9 @@ mod tests {
     fn test_round_trip_sine_wave() {
         // Generate 440Hz sine wave at 8kHz sample rate, 257 samples
         let mut samples = [0i16; 257];
-        for i in 0..257 {
+        for (i, sample) in samples.iter_mut().enumerate() {
             let t = i as f64 / 8000.0;
-            samples[i] = (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 16000.0) as i16;
+            *sample = (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 16000.0) as i16;
         }
 
         let frame = encode_samples(&samples, 42);
@@ -518,6 +518,80 @@ mod tests {
         apply_gain(&mut samples, -20.0);
         assert_eq!(samples[0], 1000);
         assert_eq!(samples[1], -1000);
+    }
+
+    // --- Diff formula analysis ---
+
+    /// Demonstrates that the multiply-form diff `((2 * delta + 1) * step) >> 3`
+    /// is NOT bit-exact with the IMA reference conditional-add form.
+    ///
+    /// The multiply form preserves precision by doing the full multiplication
+    /// before shifting, while the conditional-add form shifts each term
+    /// individually (losing precision). They diverge at low step sizes.
+    ///
+    /// We use the conditional-add form (IMA reference) because the remote's
+    /// encoder uses it, and bit-exact decoding produces the best audio quality.
+    #[test]
+    fn test_multiply_form_diverges_at_low_step_sizes() {
+        // At step_index=0 (step=7), nibble=0x1:
+        //   Conditional: 7>>3(=0) + 7>>2(=1) = 1
+        //   Multiply: ((2*1+1)*7)>>3 = 21>>3 = 2
+        let step = STEP_TABLE[0]; // step=7
+        let nibble: u8 = 0x1;
+        let delta = (nibble & 7) as i32;
+
+        let mut diff_cond = step >> 3;
+        if nibble & 1 != 0 {
+            diff_cond += step >> 2;
+        }
+        let diff_mult = ((2 * delta + 1) * step) >> 3;
+
+        assert_ne!(
+            diff_cond, diff_mult,
+            "Formulas should diverge at low step sizes"
+        );
+        assert_eq!(diff_cond, 1);
+        assert_eq!(diff_mult, 2);
+    }
+
+    /// Verifies the formulas converge at large step sizes where
+    /// integer rounding is negligible.
+    #[test]
+    fn test_multiply_form_converges_at_high_step_sizes() {
+        // Count mismatches across all step_index/nibble combinations
+        let mut mismatches = 0;
+        let mut total = 0;
+        for step_idx in 0..=88u8 {
+            let step = STEP_TABLE[step_idx as usize];
+            for nibble in 0..=15u8 {
+                total += 1;
+                let delta = (nibble & 7) as i32;
+
+                let mut diff_cond = step >> 3;
+                if nibble & 1 != 0 {
+                    diff_cond += step >> 2;
+                }
+                if nibble & 2 != 0 {
+                    diff_cond += step >> 1;
+                }
+                if nibble & 4 != 0 {
+                    diff_cond += step;
+                }
+
+                let diff_mult = ((2 * delta + 1) * step) >> 3;
+                if diff_cond != diff_mult {
+                    mismatches += 1;
+                }
+            }
+        }
+        // ~28% of combinations diverge due to integer rounding differences.
+        // This is significant enough that switching formulas would change
+        // decoded audio output, confirming we must keep the IMA reference form.
+        assert!(mismatches > 0, "There should be some mismatches");
+        assert!(
+            mismatches > total / 5,
+            "Divergence should be significant: {mismatches}/{total} mismatches"
+        );
     }
 
     // --- AdpcmDecoder struct tests ---

@@ -517,7 +517,6 @@ mod tests {
     const V04_MIC_CLOSE: &[u8] = &[0x0D];
 
     /// CTL opcodes for test injection
-    const CTL_AUDIO_STOP: u8 = 0x00;
     const CTL_AUDIO_START: u8 = 0x04;
     const CTL_START_SEARCH: u8 = 0x08;
 

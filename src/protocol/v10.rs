@@ -309,7 +309,7 @@ mod tests {
         match p.parse_ctl(&[0x04, 0x03, 0x01, 0x02]) {
             CtlEvent::AudioStart {
                 reason,
-                codec,
+                codec: _,
                 stream_id,
             } => {
                 assert_eq!(reason, AudioStartReason::HoldToTalk);
