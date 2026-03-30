@@ -98,7 +98,6 @@ atvvoice [OPTIONS]
 | `--frame-timeout` | 5 | Seconds without frames before auto-closing mic (device asleep). 0 = disabled. |
 | `-t, --idle-timeout` | 0 | Seconds since last mic button press before auto-closing mic. Only resets on the voice/assistant button, not other remote buttons. 0 = disabled. |
 | `--keep-alive` | 10 | Seconds between keepalive messages to prevent the remote's audio transfer timeout. 0 = disabled. See [Audio keepalive](#audio-keepalive). |
-| `--protocol-version` | auto | Override ATVV protocol version (e.g. `0.4`, `1.0`). Auto-detected from CAPS_RESP if omitted. See [Audio keepalive](#audio-keepalive). |
 | `-n, --name` | | Instance name suffix. Sets PW node and D-Bus name (e.g. `--name living-room`). |
 | `--description` | BLE device name | PipeWire node description (shown in audio settings). Defaults to the remote's BLE name (e.g. "G20S PRO"). |
 | `--no-dbus` | | Disable D-Bus control interface |
@@ -119,7 +118,7 @@ ATVVoice sends periodic keepalive messages to reset this timer, allowing audio s
 | v1.0+ | `MIC_EXTEND` | Silent - no response from remote, no stream disruption |
 | v0.4 | `MIC_OPEN` (fallback) | Remote sends `AUDIO_START` and resets its sequence counter, but audio data continues uninterrupted. |
 
-The protocol version is auto-detected from the remote's `CAPS_RESP` message. Use `--protocol-version` to override if detection is wrong (e.g. `--protocol-version 1.0` to force `MIC_EXTEND`).
+The protocol version is auto-detected from the remote's `CAPS_RESP` message.
 
 Set `--keep-alive 0` to disable keepalive entirely (audio will stop at the remote's hardware timeout, typically ~30 seconds).
 
@@ -192,10 +191,6 @@ services.atvvoice = {
   # null (default) = 10.
   keepAlive = 10;
 
-  # Override ATVV protocol version (e.g. "0.4", "1.0").
-  # null (default) = auto-detect from CAPS_RESP.
-  protocolVersion = null;
-
   # Log verbosity: 0 = info, 1 = debug, 2+ = trace. null (default) = 0.
   verbose = 1;
 
@@ -235,7 +230,7 @@ busctl --user monitor org.atvvoice.g20s-pro
 
 | Properties | Type | Description |
 |------------|------|-------------|
-| `State` | `s` | `"init"`, `"ready"`, `"opening"`, `"streaming"` |
+| `State` | `s` | `"disconnected"`, `"connected"`, `"opening"`, `"streaming"` |
 | `DeviceAddress` | `s` | BT address of connected remote |
 | `NodeName` | `s` | PipeWire node name |
 

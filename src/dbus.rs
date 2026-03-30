@@ -70,7 +70,7 @@ impl DaemonInterface {
         Ok(())
     }
 
-    /// Current state: "init", "ready", "opening", "streaming".
+    /// Current state: "disconnected", "connected", "opening", "streaming".
     #[zbus(property)]
     async fn state(&self) -> String {
         self.state_rx.borrow().to_string()

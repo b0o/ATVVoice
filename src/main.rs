@@ -290,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let gain = cli.gain;
 
         // State watch channel: atvv -> D-Bus (if enabled).
-        let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Ready);
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Disconnected);
 
         // Set up D-Bus control interface (if feature and CLI allow).
         #[cfg(feature = "dbus")]
@@ -341,6 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             tracing::info!("Negotiated protocol: {} ({:?})", caps.version, caps.codecs);
+            let _ = state_tx.send(atvv::State::Connected);
             let mut session_protocol = match protocol::create_protocol(&caps) {
                 Ok(p) => p,
                 Err(e) => {
@@ -434,7 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Update D-Bus state
-            let _ = state_tx.send(atvv::State::Ready);
+            let _ = state_tx.send(atvv::State::Disconnected);
 
             // Wait for device to reconnect
             ensure_connected(&device).await;

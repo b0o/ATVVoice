@@ -20,7 +20,8 @@ pub enum MicMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Ready,
+    Disconnected,
+    Connected,
     Opening,
     Streaming,
 }
@@ -28,7 +29,8 @@ pub enum State {
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ready => write!(f, "ready"),
+            Self::Disconnected => write!(f, "disconnected"),
+            Self::Connected => write!(f, "connected"),
             Self::Opening => write!(f, "opening"),
             Self::Streaming => write!(f, "streaming"),
         }
@@ -119,7 +121,7 @@ pub async fn run_session(
         mut command_rx,
         state_tx,
     } = config;
-    let mut state = State::Ready;
+    let mut state = State::Connected;
 
     // set_state takes &mut State as a parameter rather than capturing it because
     // `state` is used independently in the tokio::select! branches below. Capturing
@@ -180,7 +182,7 @@ pub async fn run_session(
                             ble.write_command(&protocol.mic_close_cmd(sid)).await?;
                             tracing::info!("Sent MIC_CLOSE");
                         }
-                        set_state(State::Ready, &mut state);
+                        set_state(State::Connected, &mut state);
                         last_seq = None;
                         current_stream_id = None;
                     }
@@ -210,7 +212,7 @@ pub async fn run_session(
                                     // Toggle: second press stops streaming
                                     ble.write_command(&protocol.mic_close_cmd(sid)).await?;
                                     tracing::info!("Sent MIC_CLOSE (toggle off)");
-                                    set_state(State::Ready, &mut state);
+                                    set_state(State::Connected, &mut state);
                                     last_seq = None;
                                     current_stream_id = None;
                                 }
@@ -247,7 +249,7 @@ pub async fn run_session(
                     CtlEvent::MicOpenError(code) => {
                         tracing::warn!("MIC_OPEN_ERROR: {:?}", code);
                         if state == State::Opening {
-                            set_state(State::Ready, &mut state);
+                            set_state(State::Connected, &mut state);
                             current_stream_id = None;
                         }
                     }
@@ -293,7 +295,7 @@ pub async fn run_session(
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 match cmd {
                     ExternalCommand::MicOpen => {
-                        if state == State::Ready {
+                        if state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (external)");
                             set_state(State::Opening, &mut state);
@@ -306,7 +308,7 @@ pub async fn run_session(
                         if state == State::Streaming || state == State::Opening {
                             ble.write_command(&protocol.mic_close_cmd(sid)).await?;
                             tracing::info!("Sent MIC_CLOSE (external)");
-                            set_state(State::Ready, &mut state);
+                            set_state(State::Connected, &mut state);
                             last_seq = None;
                             current_stream_id = None;
                         }
@@ -315,10 +317,10 @@ pub async fn run_session(
                         if state == State::Streaming || state == State::Opening {
                             ble.write_command(&protocol.mic_close_cmd(sid)).await?;
                             tracing::info!("Sent MIC_CLOSE (external toggle)");
-                            set_state(State::Ready, &mut state);
+                            set_state(State::Connected, &mut state);
                             last_seq = None;
                             current_stream_id = None;
-                        } else if state == State::Ready {
+                        } else if state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (external toggle)");
                             set_state(State::Opening, &mut state);
@@ -341,7 +343,7 @@ pub async fn run_session(
                 tracing::info!("Frame timeout ({:?}) - device likely asleep, closing mic", timeouts.frame_timeout);
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
-                set_state(State::Ready, &mut state);
+                set_state(State::Connected, &mut state);
                 last_seq = None;
                 current_stream_id = None;
             }
@@ -349,7 +351,7 @@ pub async fn run_session(
                 tracing::info!("Idle timeout ({:?}) - no button activity, closing mic", timeouts.idle_timeout);
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
-                set_state(State::Ready, &mut state);
+                set_state(State::Connected, &mut state);
                 last_seq = None;
                 current_stream_id = None;
             }
@@ -530,7 +532,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::from_millis(100),
@@ -572,7 +574,7 @@ mod tests {
 
         // No GET_CAPS to drain -- session starts in Ready
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // START_SEARCH → Opening
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
@@ -596,13 +598,13 @@ mod tests {
         // START_SEARCH → toggle off → Ready
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
         drain_commands(&mut ctrl.commands_rx).await; // MIC_CLOSE
 
         // Wait 200ms - timer would have fired if not properly managed (but state is Ready,
         // so the guard `if frame_timeout_enabled && (state == Streaming || Opening)` prevents it)
         tokio::time::advance(Duration::from_millis(200)).await;
-        assert_eq!(*state_rx.borrow(), State::Ready);
+        assert_eq!(*state_rx.borrow(), State::Connected);
 
         // START_SEARCH → Opening again
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
@@ -616,7 +618,7 @@ mod tests {
 
         // Verify frame timeout DOES fire after the full 100ms from the new Opening
         tokio::time::advance(Duration::from_millis(60)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // Clean up: disconnect
         ctrl.event_tx
@@ -634,7 +636,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -673,7 +675,7 @@ mod tests {
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // START_SEARCH from Ready → Opening, MIC_OPEN sent
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
@@ -690,7 +692,7 @@ mod tests {
         // START_SEARCH from Streaming → Ready (toggle off), MIC_CLOSE sent (NOT MIC_OPEN)
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
         let cmds = drain_commands(&mut ctrl.commands_rx).await;
         assert_eq!(cmds, vec![V04_MIC_CLOSE.to_vec()]);
 
@@ -717,7 +719,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -756,7 +758,7 @@ mod tests {
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // START_SEARCH from Ready → Opening, MIC_OPEN sent
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
@@ -796,7 +798,7 @@ mod tests {
 
         let (device, ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Ready);
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Connected);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -855,7 +857,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
         let (cmd_tx, mut cmd_rx) = tokio_mpsc::channel::<ExternalCommand>(16);
 
         let timeouts = SessionTimeouts {
@@ -895,7 +897,7 @@ mod tests {
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // MicOpen from Ready → Opening
         cmd_tx.send(ExternalCommand::MicOpen).await.unwrap();
@@ -912,7 +914,7 @@ mod tests {
         // MicClose from Streaming → Ready
         cmd_tx.send(ExternalCommand::MicClose).await.unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
         let cmds = drain_commands(&mut ctrl.commands_rx).await;
         assert_eq!(cmds, vec![V04_MIC_CLOSE.to_vec()]);
 
@@ -931,7 +933,7 @@ mod tests {
         // MicToggle from Streaming → Ready
         cmd_tx.send(ExternalCommand::MicToggle).await.unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
         let cmds = drain_commands(&mut ctrl.commands_rx).await;
         assert_eq!(cmds, vec![V04_MIC_CLOSE.to_vec()]);
 
@@ -951,7 +953,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -990,7 +992,7 @@ mod tests {
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // START_SEARCH → Opening (resets idle timer)
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
@@ -1007,7 +1009,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(50)).await;
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
         drain_commands(&mut ctrl.commands_rx).await;
 
         // Wait 50ms, then START_SEARCH again → Opening (resets idle timer)
@@ -1023,7 +1025,7 @@ mod tests {
 
         // But it DOES fire at the full 100ms from the last reset
         tokio::time::advance(Duration::from_millis(60)).await;
-        assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
         // Clean up
         ctrl.event_tx
