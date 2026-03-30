@@ -20,7 +20,6 @@ pub enum MicMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Init,
     Ready,
     Opening,
     Streaming,
@@ -29,7 +28,6 @@ pub enum State {
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Init => write!(f, "init"),
             Self::Ready => write!(f, "ready"),
             Self::Opening => write!(f, "opening"),
             Self::Streaming => write!(f, "streaming"),
@@ -70,6 +68,14 @@ pub type BleFut<'a, T> = Pin<Box<dyn std::future::Future<Output = Result<T>> + S
 /// A boxed async stream of `T`.
 pub type BleStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
+/// BLE notification streams for an active session.
+/// Created during negotiation and passed to `run_session`.
+pub struct BleStreams {
+    pub ctl: BleStream<Vec<u8>>,
+    pub rx: BleStream<Vec<u8>>,
+    pub events: BleStream<DeviceConnectionEvent>,
+}
+
 /// Abstraction over BLE device operations for testability.
 pub trait BleDevice: Send {
     /// Write a command to the TX characteristic.
@@ -85,25 +91,39 @@ pub trait BleDevice: Send {
     fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>>;
 }
 
+/// Configuration and channels for a session.
+pub struct SessionConfig<'a> {
+    pub audio_tx: mpsc::Sender<AudioFrame>,
+    pub mic_mode: MicMode,
+    pub timeouts: &'a SessionTimeouts,
+    pub command_rx: Option<&'a mut mpsc::Receiver<ExternalCommand>>,
+    pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
+}
+
 /// Run the ATVV protocol session.
 ///
-/// Audio frames (decoded PCM) are sent to `audio_tx`.
-/// External commands (e.g. from D-Bus) are received on `command_rx`.
-/// State changes are broadcast via `state_tx` (for D-Bus signals, etc.).
+/// Audio frames (decoded PCM) are sent to `config.audio_tx`.
+/// External commands (e.g. from D-Bus) are received on `config.command_rx`.
+/// State changes are broadcast via `config.state_tx` (for D-Bus signals, etc.).
 /// Returns on device disconnect or unrecoverable error.
 pub async fn run_session(
     ble: &(impl BleDevice + ?Sized),
     protocol: &mut dyn Protocol,
-    audio_tx: mpsc::Sender<AudioFrame>,
-    mic_mode: MicMode,
-    timeouts: &SessionTimeouts,
-    mut command_rx: Option<&mut mpsc::Receiver<ExternalCommand>>,
-    state_tx: Option<&tokio::sync::watch::Sender<State>>,
+    streams: BleStreams,
+    config: SessionConfig<'_>,
 ) -> Result<()> {
-    #[allow(unused_assignments)] // Init is overwritten after GET_CAPS; kept for clarity
-    let mut state = State::Init;
+    let SessionConfig {
+        audio_tx,
+        mic_mode,
+        timeouts,
+        mut command_rx,
+        state_tx,
+    } = config;
+    let mut state = State::Ready;
 
-    // Helper to update state and notify observers.
+    // set_state takes &mut State as a parameter rather than capturing it because
+    // `state` is used independently in the tokio::select! branches below. Capturing
+    // it mutably would prevent its use in match guards and conditions.
     let set_state = |s: State, state: &mut State| {
         *state = s;
         if let Some(tx) = state_tx {
@@ -111,20 +131,13 @@ pub async fn run_session(
         }
     };
 
-    // Subscribe to notifications
-    let ctl_stream = ble.ctl_notifications().await?;
-    let rx_stream = ble.rx_notifications().await?;
+    // Destructure pre-subscribed BLE streams
+    let ctl_stream = streams.ctl;
+    let rx_stream = streams.rx;
+    let device_events = streams.events;
     tokio::pin!(ctl_stream);
     tokio::pin!(rx_stream);
-
-    // Monitor device connection state
-    let device_events = ble.connection_events().await?;
     tokio::pin!(device_events);
-
-    // Send GET_CAPS
-    ble.write_command(&protocol.get_caps_cmd()).await?;
-    tracing::info!("Sent GET_CAPS ({})", protocol.version());
-    set_state(State::Ready, &mut state);
 
     let mut last_seq: Option<u16> = None;
 
@@ -229,16 +242,7 @@ pub async fn run_session(
                         protocol.on_audio_sync(sync);
                     }
                     CtlEvent::CapsResp(caps) => {
-                        tracing::info!("CAPS_RESP: version={:?}, codecs={:?}, model={:?}, frame_size={}",
-                            caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0);
-                        match protocol.on_caps_resp(&caps) {
-                            Ok(codec) => {
-                                tracing::info!("Negotiated codec: {:?} ({}Hz)", codec, codec.sample_rate());
-                            }
-                            Err(e) => {
-                                tracing::error!("Codec negotiation failed: {}", e);
-                            }
-                        }
+                        tracing::debug!("Ignoring unsolicited CAPS_RESP: {:?}", caps.version);
                     }
                     CtlEvent::MicOpenError(code) => {
                         tracing::warn!("MIC_OPEN_ERROR: {:?}", code);
@@ -511,8 +515,6 @@ mod tests {
         }
     }
 
-    /// v0.4 expected command bytes (for test assertions)
-    const V04_GET_CAPS: &[u8] = &[0x0A, 0x00, 0x04, 0x00, 0x03];
     const V04_MIC_OPEN: &[u8] = &[0x0C, 0x00, 0x01];
     const V04_MIC_CLOSE: &[u8] = &[0x0D];
 
@@ -528,7 +530,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Init);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::from_millis(100),
@@ -536,25 +538,40 @@ mod tests {
             keepalive: Duration::ZERO,
         };
 
+        // Pre-initialize protocol with capabilities
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
         let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        // Create BleStreams from mock (consumes receivers)
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
         let session = tokio::spawn(async move {
             run_session(
                 &device,
                 &mut protocol,
-                audio_tx,
-                MicMode::Toggle,
-                &timeouts,
-                None,
-                Some(&state_tx),
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    mic_mode: MicMode::Toggle,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                },
             )
             .await
         });
 
-        // Drain the initial GET_CAPS command
+        // No GET_CAPS to drain -- session starts in Ready
         tokio::time::advance(Duration::from_millis(1)).await;
-        let cmds = drain_commands(&mut ctrl.commands_rx).await;
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0], V04_GET_CAPS);
         assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
 
         // START_SEARCH → Opening
@@ -617,7 +634,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Init);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -625,22 +642,37 @@ mod tests {
             keepalive: Duration::ZERO,
         };
 
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
         let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
         let session = tokio::spawn(async move {
             run_session(
                 &device,
                 &mut protocol,
-                audio_tx,
-                MicMode::Toggle,
-                &timeouts,
-                None,
-                Some(&state_tx),
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    mic_mode: MicMode::Toggle,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                },
             )
             .await
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        drain_commands(&mut ctrl.commands_rx).await; // GET_CAPS
         assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
 
         // START_SEARCH from Ready → Opening, MIC_OPEN sent
@@ -685,7 +717,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Init);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -693,22 +725,37 @@ mod tests {
             keepalive: Duration::ZERO,
         };
 
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
         let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
         let session = tokio::spawn(async move {
             run_session(
                 &device,
                 &mut protocol,
-                audio_tx,
-                MicMode::Hold,
-                &timeouts,
-                None,
-                Some(&state_tx),
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    mic_mode: MicMode::Hold,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                },
             )
             .await
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        drain_commands(&mut ctrl.commands_rx).await; // GET_CAPS
         assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
 
         // START_SEARCH from Ready → Opening, MIC_OPEN sent
@@ -749,7 +796,7 @@ mod tests {
 
         let (device, ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Init);
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Ready);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -757,16 +804,32 @@ mod tests {
             keepalive: Duration::ZERO,
         };
 
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
         let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
         let session = tokio::spawn(async move {
             run_session(
                 &device,
                 &mut protocol,
-                audio_tx,
-                MicMode::Toggle,
-                &timeouts,
-                None,
-                Some(&state_tx),
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    mic_mode: MicMode::Toggle,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                },
             )
             .await
         });
@@ -792,7 +855,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Init);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
         let (cmd_tx, mut cmd_rx) = tokio_mpsc::channel::<ExternalCommand>(16);
 
         let timeouts = SessionTimeouts {
@@ -801,22 +864,37 @@ mod tests {
             keepalive: Duration::ZERO,
         };
 
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
         let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
         let session = tokio::spawn(async move {
             run_session(
                 &device,
                 &mut protocol,
-                audio_tx,
-                MicMode::Toggle,
-                &timeouts,
-                Some(&mut cmd_rx),
-                Some(&state_tx),
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    mic_mode: MicMode::Toggle,
+                    timeouts: &timeouts,
+                    command_rx: Some(&mut cmd_rx),
+                    state_tx: Some(&state_tx),
+                },
             )
             .await
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        drain_commands(&mut ctrl.commands_rx).await; // GET_CAPS
         assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
 
         // MicOpen from Ready → Opening
@@ -873,7 +951,7 @@ mod tests {
 
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Init);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Ready);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -881,22 +959,37 @@ mod tests {
             keepalive: Duration::ZERO,
         };
 
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
         let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
         let session = tokio::spawn(async move {
             run_session(
                 &device,
                 &mut protocol,
-                audio_tx,
-                MicMode::Toggle,
-                &timeouts,
-                None,
-                Some(&state_tx),
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    mic_mode: MicMode::Toggle,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                },
             )
             .await
         });
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        drain_commands(&mut ctrl.commands_rx).await; // GET_CAPS
         assert!(wait_for_state(&mut state_rx, State::Ready, Duration::from_millis(10)).await);
 
         // START_SEARCH → Opening (resets idle timer)

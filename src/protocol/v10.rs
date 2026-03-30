@@ -13,22 +13,39 @@ use crate::adpcm::AdpcmDecoder;
 /// - AUDIO_START/STOP/SYNC have payloads (reason, codec, stream_id, decoder state)
 /// - Audio frames are headerless (decoder state persists, reset via AUDIO_SYNC)
 ///
-/// Interaction model support bitmask sent in GET_CAPS:
-/// bit 0 = PTT (0x01), bit 1 = HTT (0x02). OnRequest is always implied.
-const SUPPORTED_INTERACTION_MODELS: u8 = 0x03;
-
 // v1.0 CTL payload minimum lengths (including opcode byte).
 const AUDIO_START_MIN_LEN: usize = 4; // opcode + reason(1) + codec(1) + stream_id(1)
 const AUDIO_SYNC_MIN_LEN: usize = 7; // opcode + codec(1) + frame_num(2) + predictor(2) + step_index(1)
 const CAPS_RESP_MIN_LEN: usize = 7; // opcode + version(2) + codecs(1) + model(1) + frame_size(2)
 const MIC_OPEN_ERROR_MIN_LEN: usize = 3; // opcode + error_code(2)
 
+/// Parse a v1.0 CAPS_RESP payload. Returns None if data is too short.
+///
+/// v1.0 layout: [opcode(1), version(2), codecs(1), interaction_model(1), frame_size(2)]
+pub(crate) fn parse_caps_resp_payload(data: &[u8]) -> Option<Capabilities> {
+    if data.len() < CAPS_RESP_MIN_LEN {
+        return None;
+    }
+    let version_wire = u16::from_be_bytes([data[1], data[2]]);
+    let version = ProtocolVersion::from_wire(version_wire).unwrap_or(ProtocolVersion::V1_0);
+    let codecs = Codecs::from_bits_truncate(data[3]);
+    let interaction_model =
+        InteractionModel::try_from(data[4]).unwrap_or(InteractionModel::OnRequest);
+    let frame_size = u16::from_be_bytes([data[5], data[6]]);
+    Some(Capabilities {
+        version,
+        codecs,
+        interaction_model,
+        audio_frame_size: AudioFrameSize(frame_size),
+    })
+}
+
 pub struct ProtocolV10 {
-    pub selected_codec: Option<Codec>,
-    pub interaction_model: InteractionModel,
-    pub audio_frame_size: AudioFrameSize,
-    pub decoder: AdpcmDecoder,
-    pub frame_seq: u16,
+    pub(crate) selected_codec: Option<Codec>,
+    pub(crate) interaction_model: InteractionModel,
+    pub(crate) audio_frame_size: AudioFrameSize,
+    pub(crate) decoder: AdpcmDecoder,
+    pub(crate) frame_seq: u16,
 }
 
 impl Default for ProtocolV10 {
@@ -47,42 +64,11 @@ impl ProtocolV10 {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Negotiate the best codec from remote's supported set.
-    fn negotiate_codec(remote_codecs: Codecs) -> Result<Codec> {
-        let ours = Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ;
-        let common = remote_codecs & ours;
-        if common.contains(Codecs::ADPCM_16KHZ) {
-            Ok(Codec::Adpcm16kHz)
-        } else if common.contains(Codecs::ADPCM_8KHZ) {
-            Ok(Codec::Adpcm8kHz)
-        } else {
-            anyhow::bail!(
-                "no common codec: remote supports {:?}, we support {:?}",
-                remote_codecs,
-                ours
-            )
-        }
-    }
 }
 
 impl Protocol for ProtocolV10 {
     fn version(&self) -> ProtocolVersion {
         ProtocolVersion::V1_0
-    }
-
-    fn get_caps_cmd(&self) -> Vec<u8> {
-        let ver = ProtocolVersion::V1_0.wire_value().to_be_bytes();
-        let codecs = (Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ).bits();
-        // interaction_models byte: bit 0 = PTT, bit 1 = HTT (OnRequest is always implied)
-        vec![
-            u8::from(TxOpcode::GetCaps),
-            ver[0],
-            ver[1],
-            0x00,
-            codecs,
-            SUPPORTED_INTERACTION_MODELS,
-        ]
     }
 
     fn mic_open_cmd(&self) -> Vec<u8> {
@@ -149,26 +135,10 @@ impl Protocol for ProtocolV10 {
                     CtlEvent::Unknown(data.to_vec())
                 }
             }
-            CtlOpcode::CapsResp => {
-                // v1.0: [opcode, version(2), codecs(1), interaction_model(1), frame_size(2), extra_config(1), reserved(1)]
-                if data.len() >= CAPS_RESP_MIN_LEN {
-                    let version_wire = u16::from_be_bytes([data[1], data[2]]);
-                    let version =
-                        ProtocolVersion::from_wire(version_wire).unwrap_or(ProtocolVersion::V1_0);
-                    let codecs = Codecs::from_bits_truncate(data[3]);
-                    let interaction_model =
-                        InteractionModel::try_from(data[4]).unwrap_or(InteractionModel::OnRequest);
-                    let frame_size = u16::from_be_bytes([data[5], data[6]]);
-                    CtlEvent::CapsResp(Capabilities {
-                        version,
-                        codecs,
-                        interaction_model,
-                        audio_frame_size: AudioFrameSize(frame_size),
-                    })
-                } else {
-                    CtlEvent::Unknown(data.to_vec())
-                }
-            }
+            CtlOpcode::CapsResp => match parse_caps_resp_payload(data) {
+                Some(caps) => CtlEvent::CapsResp(caps),
+                None => CtlEvent::Unknown(data.to_vec()),
+            },
             CtlOpcode::MicOpenError => {
                 if data.len() >= MIC_OPEN_ERROR_MIN_LEN {
                     let code = u16::from_be_bytes([data[1], data[2]]);
@@ -181,7 +151,7 @@ impl Protocol for ProtocolV10 {
     }
 
     fn on_caps_resp(&mut self, caps: &Capabilities) -> Result<Codec> {
-        let codec = Self::negotiate_codec(caps.codecs)?;
+        let codec = super::negotiate_codec(caps.codecs)?;
         self.selected_codec = Some(codec);
         self.interaction_model = caps.interaction_model;
         self.audio_frame_size = caps.audio_frame_size;
@@ -202,7 +172,9 @@ impl Protocol for ProtocolV10 {
 
         Some(AudioFrame {
             seq,
-            codec: self.selected_codec.unwrap_or(Codec::Adpcm8kHz),
+            codec: self
+                .selected_codec
+                .expect("codec must be negotiated before decode"),
             samples,
         })
     }
@@ -231,18 +203,6 @@ mod tests {
     use super::*;
 
     // ── Command encoding tests ──────────────────────────────────────
-
-    #[test]
-    fn test_get_caps_cmd() {
-        let p = ProtocolV10::new();
-        let cmd = p.get_caps_cmd();
-        assert_eq!(cmd[0], 0x0A);
-        assert_eq!(cmd[1], 0x01); // version 1.0 high
-        assert_eq!(cmd[2], 0x00); // version 1.0 low
-        assert_eq!(cmd[3], 0x00); // legacy 0x0003 high
-        assert_eq!(cmd[4], 0x03); // legacy 0x0003 low
-        assert_eq!(cmd[5], 0x03); // support HTT+PTT+OnRequest
-    }
 
     #[test]
     fn test_mic_open_cmd() {
@@ -412,5 +372,24 @@ mod tests {
         assert_eq!(af.samples.len(), 40);
         // frame_seq should have incremented
         assert_eq!(p.frame_seq, 1);
+    }
+
+    // ── parse_caps_resp_payload tests ───────────────────────────────
+
+    #[test]
+    fn test_parse_caps_resp_payload_valid() {
+        // v1.0: [0x0B, version(2), codecs(1), model(1), frame_size(2)]
+        let data: &[u8] = &[0x0B, 0x01, 0x00, 0x03, 0x03, 0x00, 0x80];
+        let caps = parse_caps_resp_payload(data).unwrap();
+        assert_eq!(caps.version, ProtocolVersion::V1_0);
+        assert_eq!(caps.codecs, Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ);
+        assert_eq!(caps.interaction_model, InteractionModel::HoldToTalk);
+        assert_eq!(caps.audio_frame_size, AudioFrameSize(128));
+    }
+
+    #[test]
+    fn test_parse_caps_resp_payload_too_short() {
+        let data: &[u8] = &[0x0B, 0x01, 0x00];
+        assert!(parse_caps_resp_payload(data).is_none());
     }
 }

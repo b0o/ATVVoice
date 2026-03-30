@@ -18,14 +18,14 @@ Nine modules:
 | ----------------- | ------------------------ | ---------------------------------------------------------------------- |
 | BLE Discovery     | `src/ble.rs`             | Find ATVV devices, resolve GATT characteristics, AcquireNotify         |
 | Protocol Types    | `src/protocol/types.rs`  | Strongly typed wire types: opcodes, codecs, stream IDs, reasons, etc.  |
-| Protocol Trait    | `src/protocol/mod.rs`    | `Protocol` trait, `create_protocol()`, re-exports                      |
+| Protocol Trait    | `src/protocol/mod.rs`    | `Protocol` trait, `create_protocol()`, `get_caps_cmd()`, `parse_caps_resp()` |
 | Protocol v0.4     | `src/protocol/v04.rs`    | v0.4 command encoding, CTL parsing, headered frame decoding            |
 | Protocol v1.0     | `src/protocol/v10.rs`    | v1.0 command encoding, CTL parsing, headerless frame decoding, PTT/HTT |
-| Session Loop      | `src/atvv.rs`            | Generic session state machine over `dyn Protocol`                      |
+| Session Loop      | `src/atvv.rs`            | Generic session state machine over `dyn Protocol`, `BleStreams` struct  |
 | ADPCM Decoder     | `src/adpcm.rs`           | Stateful `AdpcmDecoder` struct + post-processing (declip, lowpass, gain) |
 | PipeWire Source   | `src/pw.rs`              | Virtual audio source node (own thread, not async)                      |
 | D-Bus Control     | `src/dbus.rs`            | Session bus interface for external mic control (optional feature)       |
-| CLI / Main        | `src/main.rs`            | CLI parsing, tokio runtime, reconnect loop, signal handling            |
+| CLI / Main        | `src/main.rs`            | CLI parsing, `negotiate()`, tokio runtime, reconnect loop, signal handling |
 
 ## Tech Stack
 
@@ -56,7 +56,7 @@ Service UUID: `AB5E0001-5A21-4F05-BC7D-AF01F617B664`
 
 | Command   | Bytes                      | Notes                                                        |
 | --------- | -------------------------- | ------------------------------------------------------------ |
-| GET_CAPS   | `0x0A 0x00 0x04 0x00 0x01` | Version 0.4, codecs 0x0001                                   |
+| GET_CAPS   | `0x0A 0x01 0x00 0x00 0x03 0x03` | Always v1.0: version, reserved, codecs (8k+16k), models (PTT+HTT) |
 | MIC_OPEN   | `0x0C 0x00 0x01`           | **Big-endian** codec. `0x01 0x00` is WRONG and gets rejected |
 | MIC_CLOSE  | `0x0D`                     |                                                              |
 | MIC_EXTEND | `0x0E 0x00`                | Reset audio transfer timeout. stream_id=0x00 for MIC_OPEN-initiated streams. No response expected. |
@@ -72,13 +72,18 @@ Service UUID: `AB5E0001-5A21-4F05-BC7D-AF01F617B664`
 
 ### Session Flow
 
-1. Enable notify on RX + CTL
-2. Send GET_CAPS → receive GET_CAPS_RESP
-3. User presses mic → START_SEARCH
-4. Send MIC_OPEN → AUDIO_START
-5. Audio frames stream on RX (~30.8 fps, 134 bytes each)
-6. User releases mic → AUDIO_STOP (or second START_SEARCH)
-7. Send MIC_CLOSE
+**Negotiation phase** (in `main.rs::negotiate()`):
+1. Subscribe to CTL, RX, and device event streams
+2. Send GET_CAPS (always v1.0) → receive GET_CAPS_RESP
+3. Parse CAPS_RESP to determine remote's protocol version and capabilities
+4. Create version-specific Protocol from negotiated capabilities
+
+**Session phase** (in `atvv::run_session()`):
+5. User presses mic → START_SEARCH
+6. Send MIC_OPEN → AUDIO_START
+7. Audio frames stream on RX (~30.8 fps, 134 bytes each)
+8. User releases mic → AUDIO_STOP (or second START_SEARCH)
+9. Send MIC_CLOSE
 
 **Important:** Some remotes send a second START_SEARCH instead of AUDIO_STOP when the mic button is released. The daemon supports two modes via `--mode`:
 
@@ -162,12 +167,14 @@ tokio (single-threaded) ──────────────────�
 
 12. **Sample rate (8kHz) and channel count (mono) are implied by codec 0x0001** (ADPCM). They are not separately negotiated in GET_CAPS_RESP.
 
+13. **Protocol version is auto-negotiated.** GET_CAPS always sends v1.0 (our max version). The remote's CAPS_RESP version field determines which protocol implementation is used. v0.4 remotes tolerate the extra interaction_models byte in v1.0 GET_CAPS. The `--protocol-version` CLI flag was removed.
+
 ## Development Environment
 
 - **User:** `boo` on NixOS
 - **Workspace:** `/home/boo/proj/atvvoice/worktree/main/` (bare git repo + worktree)
-- **BLE adapter:** `hci1` (not `hci0`)
-- **Test remote:** G20S Pro at `AA:BB:CC:DD:EE:FF` (already bonded)
+- **BLE adapter:** `hci0`
+- **Test remote:** G20S Pro at `69:98:98:22:FF:7B` (already bonded)
 - **Audio stack:** PipeWire (not PulseAudio directly)
 - **Python:** Not directly available - use `nix shell nixpkgs#python3`
 - **Dotfiles:** `/home/boo/dotfiles/` (Nix flake with Home Manager)
@@ -183,6 +190,18 @@ cargo run -- -d AA:BB:CC:DD:EE:FF -v                                      # Run 
 cargo run -- -d AA:BB:CC:DD:EE:FF -v -m hold                              # Hold-to-talk mode
 cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5 --idle-timeout 300 # With timeouts
 nix build                                                                 # Nix build
+```
+
+## Build & Test (with nix)
+
+```bash
+nix develop --command cargo check                                                               # Type-check
+nix develop --command cargo test                                                                # Run all tests
+nix develop --command cargo clippy --tests -- -W clippy::all                                    # Lint
+nix develop --command cargo run -- -d AA:BB:CC:DD:EE:FF -v                                      # Run with test remote
+nix develop --command cargo run -- -d AA:BB:CC:DD:EE:FF -v -m hold                              # Hold-to-talk mode
+nix develop --command cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5 --idle-timeout 300 # With timeouts
+nix build                                                                                       # Nix build
 ```
 
 ## Reference Documents
@@ -216,19 +235,6 @@ The implementation follows 8 sequential tasks with dependencies. Read `docs/plan
 | 6    | Main entry point & integration                    | Tasks 2, 3, 4, 5 |
 | 7    | Integration test with real hardware               | Task 6           |
 | 8    | Nix packaging & Home Manager module               | Task 6           |
-
-## Build & Test
-
-```bash
-cargo check                                                               # Type-check
-cargo test                                                                # Run all tests
-cargo test adpcm                                                          # Run ADPCM decoder tests only
-cargo build                                                               # Debug build
-cargo run -- -d AA:BB:CC:DD:EE:FF -v                                      # Run with test remote
-cargo run -- -d AA:BB:CC:DD:EE:FF -v -m hold                              # Hold-to-talk mode
-cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5 --idle-timeout 300 # With timeouts
-nix build                                                                 # Nix build
-```
 
 ## CI & Release
 

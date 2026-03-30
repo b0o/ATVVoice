@@ -46,10 +46,6 @@ struct Cli {
     #[arg(long, default_value = "10")]
     keep_alive: u64,
 
-    /// Override remote protocol version (e.g. "0.4", "1.0"). Auto-detected from CAPS_RESP if not set.
-    #[arg(long)]
-    protocol_version: Option<String>,
-
     /// Instance name suffix. Sets PipeWire node name and D-Bus bus name.
     #[arg(short, long)]
     name: Option<String>,
@@ -112,6 +108,60 @@ fn is_device_locked_error(e: &anyhow::Error) -> bool {
     msg.contains("exclusive") || msg.contains("NotPermitted") || msg.contains("InProgress")
 }
 
+/// Timeout waiting for CAPS_RESP during negotiation.
+const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send GET_CAPS and wait for CAPS_RESP to determine protocol version.
+async fn negotiate(
+    ble: &(impl atvv::BleDevice + ?Sized),
+) -> anyhow::Result<(protocol::types::Capabilities, atvv::BleStreams)> {
+    use futures::StreamExt;
+
+    // Subscribe to all streams up front. Only CTL is needed for negotiation,
+    // but the others must be acquired now since BLE notification handles are
+    // exclusive (can't re-subscribe later).
+    let mut ctl_stream = ble.ctl_notifications().await?;
+    let rx_stream = ble.rx_notifications().await?;
+    let device_events = ble.connection_events().await?;
+
+    ble.write_command(&protocol::get_caps_cmd()).await?;
+    tracing::info!("Sent GET_CAPS (v1.0)");
+
+    let deadline = tokio::time::sleep(NEGOTIATE_TIMEOUT);
+    tokio::pin!(deadline);
+
+    // BleStream<T> is Pin<Box<dyn Stream>>, already Unpin -- no tokio::pin! needed.
+    loop {
+        tokio::select! {
+            data = ctl_stream.next() => {
+                match data {
+                    Some(data) => {
+                        if let Some(caps) = protocol::parse_caps_resp(&data) {
+                            tracing::info!(
+                                "CAPS_RESP: version={}, codecs={:?}, model={:?}, frame_size={}",
+                                caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0
+                            );
+                            return Ok((caps, atvv::BleStreams {
+                                ctl: ctl_stream,
+                                rx: rx_stream,
+                                events: device_events,
+                            }));
+                        }
+                        // Not a CAPS_RESP (e.g., stale START_SEARCH) -- keep waiting
+                        tracing::debug!("Ignoring non-CAPS_RESP CTL during negotiation: {:02x?}", data);
+                    }
+                    None => {
+                        anyhow::bail!("device disconnected during negotiation");
+                    }
+                }
+            }
+            _ = &mut deadline => {
+                anyhow::bail!("timeout waiting for CAPS_RESP ({}s)", NEGOTIATE_TIMEOUT.as_secs());
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -159,12 +209,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_timeout: std::time::Duration::from_secs(cli.frame_timeout),
         idle_timeout: std::time::Duration::from_secs(cli.idle_timeout),
         keepalive: std::time::Duration::from_secs(cli.keep_alive),
-    };
-
-    let protocol_version = match cli.protocol_version.as_deref() {
-        Some(s) => protocol::types::ProtocolVersion::parse(s)
-            .map_err(|e| anyhow::anyhow!(e))?,
-        None => protocol::types::ProtocolVersion::V0_4,
     };
 
     // Addresses to skip during auto-discovery (locked by another instance).
@@ -246,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let gain = cli.gain;
 
         // State watch channel: atvv -> D-Bus (if enabled).
-        let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Init);
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Ready);
 
         // Set up D-Bus control interface (if feature and CLI allow).
         #[cfg(feature = "dbus")]
@@ -282,7 +326,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Inner loop: session → reconnect (same device).
         loop {
-            let mut session_protocol = protocol::create_protocol(protocol_version);
+            let ble_device = ble::BluerDevice {
+                device: &device,
+                chars: &chars,
+            };
+
+            // Negotiate protocol version
+            let (caps, streams) = match negotiate(&ble_device).await {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!("Negotiation failed: {e}");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            tracing::info!("Negotiated protocol: {} ({:?})", caps.version, caps.codecs);
+            let mut session_protocol = match protocol::create_protocol(&caps) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Protocol creation failed: {e}");
+                    continue;
+                }
+            };
 
             let (frame_tx, mut frame_rx) =
                 tokio::sync::mpsc::channel::<protocol::types::AudioFrame>(64);
@@ -311,24 +376,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            let ble_device = ble::BluerDevice {
-                device: &device,
-                chars: &chars,
-            };
             let session_result = tokio::select! {
                 result = atvv::run_session(
                     &ble_device,
                     &mut *session_protocol,
-                    frame_tx,
-                    cli.mode,
-                    &timeouts,
-                    {
-                        #[cfg(feature = "dbus")]
-                        { dbus_cmd_rx.as_mut() }
-                        #[cfg(not(feature = "dbus"))]
-                        { None }
+                    streams,
+                    atvv::SessionConfig {
+                        audio_tx: frame_tx,
+                        mic_mode: cli.mode,
+                        timeouts: &timeouts,
+                        command_rx: {
+                            #[cfg(feature = "dbus")]
+                            { dbus_cmd_rx.as_mut() }
+                            #[cfg(not(feature = "dbus"))]
+                            { None }
+                        },
+                        state_tx: Some(&state_tx),
                     },
-                    Some(&state_tx),
                 ) => result,
                 _ = &mut ctrl_c => {
                     let mic_close = session_protocol.mic_close_cmd(
@@ -370,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Update D-Bus state
-            let _ = state_tx.send(atvv::State::Init);
+            let _ = state_tx.send(atvv::State::Ready);
 
             // Wait for device to reconnect
             ensure_connected(&device).await;

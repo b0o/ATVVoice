@@ -14,8 +14,8 @@ const FRAME_HEADER_SIZE: usize = 6;
 
 /// ATVV v0.4 protocol implementation.
 pub struct ProtocolV04 {
-    pub selected_codec: Option<Codec>,
-    pub audio_frame_size: AudioFrameSize,
+    pub(crate) selected_codec: Option<Codec>,
+    pub(crate) audio_frame_size: AudioFrameSize,
     decoder: AdpcmDecoder,
 }
 
@@ -29,28 +29,35 @@ impl Default for ProtocolV04 {
     }
 }
 
+/// Parse a v0.4 CAPS_RESP payload. Returns None if data is too short.
+///
+/// v0.4 layout: [opcode(1), version(2), codecs(2), frame_size(2), bytes_per_char(2)]
+pub(crate) fn parse_caps_resp_payload(data: &[u8]) -> Option<Capabilities> {
+    if data.len() < CAPS_RESP_MIN_LEN {
+        return None;
+    }
+    let version_wire = u16::from_be_bytes([data[1], data[2]]);
+    let version = ProtocolVersion::from_wire(version_wire).unwrap_or(ProtocolVersion::V0_4);
+    // codecs_supported is 2 bytes in v0.4; only low byte has values
+    if data[3] != 0x00 {
+        tracing::trace!(
+            "v0.4 CAPS_RESP: ignoring non-zero codecs high byte: 0x{:02x}",
+            data[3]
+        );
+    }
+    let codecs = Codecs::from_bits_truncate(data[4]);
+    let frame_size = u16::from_be_bytes([data[5], data[6]]);
+    Some(Capabilities {
+        version,
+        codecs,
+        interaction_model: InteractionModel::OnRequest,
+        audio_frame_size: AudioFrameSize(frame_size),
+    })
+}
+
 impl ProtocolV04 {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Negotiate the best codec from the intersection of remote and our support.
-    /// Prefers highest quality (16kHz > 8kHz).
-    fn negotiate_codec(remote_codecs: Codecs) -> Result<Codec> {
-        // Our supported codecs (both ADPCM variants).
-        let ours = Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ;
-        let common = remote_codecs & ours;
-        if common.contains(Codecs::ADPCM_16KHZ) {
-            Ok(Codec::Adpcm16kHz)
-        } else if common.contains(Codecs::ADPCM_8KHZ) {
-            Ok(Codec::Adpcm8kHz)
-        } else {
-            anyhow::bail!(
-                "no common codec: remote supports {:?}, we support {:?}",
-                remote_codecs,
-                ours
-            )
-        }
     }
 }
 
@@ -59,14 +66,11 @@ impl Protocol for ProtocolV04 {
         ProtocolVersion::V0_4
     }
 
-    fn get_caps_cmd(&self) -> Vec<u8> {
-        let ver = ProtocolVersion::V0_4.wire_value().to_be_bytes();
-        let codecs = (Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ).bits();
-        vec![u8::from(TxOpcode::GetCaps), ver[0], ver[1], 0x00, codecs]
-    }
-
     fn mic_open_cmd(&self) -> Vec<u8> {
-        let codec_val = u8::from(self.selected_codec.unwrap_or(Codec::Adpcm8kHz));
+        let codec_val = u8::from(
+            self.selected_codec
+                .expect("codec must be negotiated before mic_open"),
+        );
         vec![u8::from(TxOpcode::MicOpen), 0x00, codec_val]
     }
 
@@ -113,25 +117,10 @@ impl Protocol for ProtocolV04 {
                     CtlEvent::Unknown(data.to_vec())
                 }
             }
-            CtlOpcode::CapsResp => {
-                // v0.4: [opcode, version(2), codecs_supported(2), bytes_per_frame(2), bytes_per_characteristic(2)]
-                if data.len() >= CAPS_RESP_MIN_LEN {
-                    let version_wire = u16::from_be_bytes([data[1], data[2]]);
-                    let version =
-                        ProtocolVersion::from_wire(version_wire).unwrap_or(ProtocolVersion::V0_4);
-                    // codecs_supported is 2 bytes in v0.4; only low byte has values
-                    let codecs = Codecs::from_bits_truncate(data[4]);
-                    let frame_size = u16::from_be_bytes([data[5], data[6]]);
-                    CtlEvent::CapsResp(Capabilities {
-                        version,
-                        codecs,
-                        interaction_model: InteractionModel::OnRequest,
-                        audio_frame_size: AudioFrameSize(frame_size),
-                    })
-                } else {
-                    CtlEvent::Unknown(data.to_vec())
-                }
-            }
+            CtlOpcode::CapsResp => match parse_caps_resp_payload(data) {
+                Some(caps) => CtlEvent::CapsResp(caps),
+                None => CtlEvent::Unknown(data.to_vec()),
+            },
             CtlOpcode::MicOpenError => {
                 if data.len() >= MIC_OPEN_ERROR_MIN_LEN {
                     let code = u16::from_be_bytes([data[1], data[2]]);
@@ -144,7 +133,7 @@ impl Protocol for ProtocolV04 {
     }
 
     fn on_caps_resp(&mut self, caps: &Capabilities) -> Result<Codec> {
-        let codec = Self::negotiate_codec(caps.codecs)?;
+        let codec = super::negotiate_codec(caps.codecs)?;
         self.selected_codec = Some(codec);
         self.audio_frame_size = caps.audio_frame_size;
         Ok(codec)
@@ -177,7 +166,9 @@ impl Protocol for ProtocolV04 {
 
         Some(AudioFrame {
             seq,
-            codec: self.selected_codec.unwrap_or(Codec::Adpcm8kHz),
+            codec: self
+                .selected_codec
+                .expect("codec must be negotiated before decode"),
             samples,
         })
     }
@@ -197,12 +188,6 @@ mod tests {
     use super::*;
 
     // ── Command encoding tests ──────────────────────────────────────
-
-    #[test]
-    fn test_get_caps_cmd() {
-        let p = ProtocolV04::new();
-        assert_eq!(p.get_caps_cmd(), vec![0x0A, 0x00, 0x04, 0x00, 0x03]);
-    }
 
     #[test]
     fn test_mic_open_cmd_8khz() {
@@ -369,5 +354,24 @@ mod tests {
         let mut p = ProtocolV04::new();
         p.audio_frame_size = AudioFrameSize(134);
         assert!(p.decode_audio(&[0u8; 100]).is_none());
+    }
+
+    // ── parse_caps_resp_payload tests ───────────────────────────────
+
+    #[test]
+    fn test_parse_caps_resp_payload_valid() {
+        // v0.4 CAPS_RESP: [0x0B, version(2), codecs(2), frame_size(2), bytes_per_char(2)]
+        let data: &[u8] = &[0x0B, 0x00, 0x04, 0x00, 0x01, 0x00, 0x86, 0x00, 0x14];
+        let caps = parse_caps_resp_payload(data).unwrap();
+        assert_eq!(caps.version, ProtocolVersion::V0_4);
+        assert_eq!(caps.codecs, Codecs::ADPCM_8KHZ);
+        assert_eq!(caps.audio_frame_size, AudioFrameSize(134));
+        assert_eq!(caps.interaction_model, InteractionModel::OnRequest);
+    }
+
+    #[test]
+    fn test_parse_caps_resp_payload_too_short() {
+        let data: &[u8] = &[0x0B, 0x00, 0x04];
+        assert!(parse_caps_resp_payload(data).is_none());
     }
 }
