@@ -106,12 +106,6 @@
             description = "Seconds without audio frames before auto-closing mic. null = app default (5). 0 = disabled.";
           };
 
-          idleTimeout = mkOption {
-            type = types.nullOr types.int;
-            default = null;
-            description = "Seconds since last mic button press before auto-closing mic. Only resets on voice/assistant button. null = app default (0/disabled).";
-          };
-
           keepAlive = mkOption {
             type = types.nullOr types.int;
             default = null;
@@ -141,6 +135,12 @@
             default = false;
             description = "Disable D-Bus control interface.";
           };
+
+          micOnDemand = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Auto-open mic when a PipeWire client connects, auto-close when all disconnect.";
+          };
         };
 
         config = mkIf cfg.enable {
@@ -156,12 +156,12 @@
                 ++ lib.optionals (cfg.adapter != null) ["-a" cfg.adapter]
                 ++ lib.optionals (cfg.gain != null) ["-g" (toString cfg.gain)]
                 ++ lib.optionals (cfg.frameTimeout != null) ["--frame-timeout" (toString cfg.frameTimeout)]
-                ++ lib.optionals (cfg.idleTimeout != null) ["--idle-timeout" (toString cfg.idleTimeout)]
                 ++ lib.optionals (cfg.keepAlive != null) ["--keep-alive" (toString cfg.keepAlive)]
                 ++ lib.optionals (cfg.verbose != null) (lib.genList (_: "-v") cfg.verbose)
                 ++ lib.optionals (cfg.name != null) ["--name" cfg.name]
                 ++ lib.optionals (cfg.description != null) ["--description" cfg.description]
-                ++ lib.optionals cfg.noDbus ["--no-dbus"];
+                ++ lib.optionals cfg.noDbus ["--no-dbus"]
+                ++ lib.optionals cfg.micOnDemand ["--mic-on-demand"];
             in {
               Type = "simple";
               ExecStart = "${cfg.package}/bin/atvvoice ${lib.escapeShellArgs args}";

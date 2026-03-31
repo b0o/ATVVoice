@@ -3,6 +3,7 @@
 mod adpcm;
 mod atvv;
 mod ble;
+mod consumer;
 #[cfg(feature = "dbus")]
 mod dbus;
 mod protocol;
@@ -41,10 +42,6 @@ struct Cli {
     #[arg(long, default_value = "5")]
     frame_timeout: u64,
 
-    /// Close mic after N seconds since last mic button press. 0 = disabled.
-    #[arg(short = 't', long, default_value = "0")]
-    idle_timeout: u64,
-
     /// Re-send MIC_OPEN every N seconds to prevent remote's audio transfer timeout. 0 = disabled.
     #[arg(long, default_value = "10")]
     keep_alive: u64,
@@ -61,6 +58,12 @@ struct Cli {
     #[cfg(feature = "dbus")]
     #[arg(long)]
     no_dbus: bool,
+
+    /// Enable automatic mic open/close based on PipeWire consumer presence.
+    /// When a PipeWire client connects to the virtual source, the mic opens
+    /// automatically. When all clients disconnect, the mic closes immediately.
+    #[arg(long)]
+    mic_on_demand: bool,
 
     /// Increase log verbosity (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -198,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if cli.mic_on_demand && cli.frame_timeout == 0 {
+        tracing::warn!("--mic-on-demand without --frame-timeout: mic may get stuck in Opening state if remote is asleep");
+    }
+
     // Connect to BlueZ
     let session = bluer::Session::new().await?;
     let adapter = match &cli.adapter {
@@ -213,7 +220,6 @@ async fn main() -> anyhow::Result<()> {
 
     let timeouts = atvv::SessionTimeouts {
         frame_timeout: std::time::Duration::from_secs(cli.frame_timeout),
-        idle_timeout: std::time::Duration::from_secs(cli.idle_timeout),
         keepalive: std::time::Duration::from_secs(cli.keep_alive),
     };
 
@@ -343,8 +349,29 @@ async fn main() -> anyhow::Result<()> {
                 result = negotiate(&ble_device) => match result {
                     Ok(r) => r,
                     Err(e) => {
+                        if is_device_locked_error(&e) {
+                            if filter_addr.is_some() {
+                                anyhow::bail!(
+                                    "Device {} is already in use by another ATVVoice instance.",
+                                    device.address()
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "Device {} is locked by another instance, looking for another device...",
+                                    device.address()
+                                );
+                                excluded_addrs.insert(device.address());
+                                continue 'discover;
+                            }
+                        }
                         tracing::error!("Negotiation failed: {e}");
-                        tokio::time::sleep(RETRY_DELAY).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(RETRY_DELAY) => {}
+                            _ = tokio::signal::ctrl_c() => {
+                                tracing::info!("Shutting down");
+                                break 'discover;
+                            }
+                        }
                         continue;
                     }
                 },
@@ -370,12 +397,25 @@ async fn main() -> anyhow::Result<()> {
             let (pw_shutdown_tx, pw_shutdown_rx) =
                 pipewire::channel::channel::<pw::Shutdown>();
 
+            let (consumer_tx, consumer_rx) = if cli.mic_on_demand {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+
             let pw_name = node_name.clone();
             let pw_desc = node_description.clone();
             let pw_thread = std::thread::spawn(move || {
-                if let Err(e) =
-                    pw::run_pw_source(pcm_rx, gain, sample_rate, &pw_name, &pw_desc, pw_shutdown_rx)
-                {
+                if let Err(e) = pw::run_pw_source(
+                    pcm_rx,
+                    gain,
+                    sample_rate,
+                    &pw_name,
+                    &pw_desc,
+                    pw_shutdown_rx,
+                    consumer_tx,
+                ) {
                     tracing::error!("PipeWire error: {}", e);
                 }
             });
@@ -406,6 +446,8 @@ async fn main() -> anyhow::Result<()> {
                             { None }
                         },
                         state_tx: Some(&state_tx),
+                        consumer_rx,
+                        mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,
                 _ = tokio::signal::ctrl_c() => {

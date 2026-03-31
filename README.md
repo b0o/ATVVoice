@@ -95,11 +95,11 @@ atvvoice [OPTIONS]
 | `-a, --adapter` | auto | BlueZ adapter name |
 | `-g, --gain` | 20 | Audio gain in dB |
 | `--frame-timeout` | 5 | Seconds without frames before auto-closing mic (device asleep). 0 = disabled. |
-| `-t, --idle-timeout` | 0 | Seconds since last mic button press before auto-closing mic. Only resets on the voice/assistant button, not other remote buttons. 0 = disabled. |
 | `--keep-alive` | 10 | Seconds between keepalive messages to prevent the remote's audio transfer timeout. 0 = disabled. See [Audio keepalive](#audio-keepalive). |
 | `-n, --name` | | Instance name suffix. Sets PW node and D-Bus name (e.g. `--name living-room`). |
 | `--description` | BLE device name | PipeWire node description (shown in audio settings). Defaults to the remote's BLE name (e.g. "G20S PRO"). |
 | `--no-dbus` | | Disable D-Bus control interface |
+| `--mic-on-demand` | off | Auto-open mic when a PipeWire client connects, auto-close when all clients disconnect. Monitor connections (e.g. pavucontrol) are excluded. See [Mic on demand](#mic-on-demand). |
 | `-v` | off | Verbosity (`-v` debug, `-vv` trace) |
 
 The remote appears by its BLE device name (e.g. "G20S PRO") in PipeWire/PulseAudio audio input settings. The microphone source appears when the device connects and disappears when it disconnects. ATVVoice automatically reconnects when the device comes back.
@@ -118,6 +118,17 @@ ATVVoice sends periodic keepalive messages to reset this timer, allowing audio s
 The protocol version is auto-detected from the remote's `CAPS_RESP` message.
 
 Set `--keep-alive 0` to disable keepalive entirely (audio will stop at the remote's hardware timeout, typically ~30 seconds).
+
+### Mic on demand
+
+With `--mic-on-demand`, the mic opens automatically when a PipeWire client connects to the virtual microphone source, and closes immediately when all clients disconnect.
+
+Disabled by default — the mic does not open without user intent unless this flag is set.
+
+Recommended settings:
+```bash
+atvvoice -d AA:BB:CC:DD:EE:FF --mic-on-demand --frame-timeout 5
+```
 
 ### Multiple remotes
 
@@ -175,11 +186,6 @@ services.atvvoice = {
   # null (default) = 5.
   frameTimeout = 5;
 
-  # Seconds since last mic button press before auto-closing mic.
-  # Only resets on the voice/assistant button, not other remote buttons.
-  # 0 = disabled. null (default) = 0.
-  idleTimeout = 300;
-
   # Seconds between keepalive messages. 0 = disabled.
   # null (default) = 10.
   keepAlive = 10;
@@ -197,6 +203,9 @@ services.atvvoice = {
 
   # Disable D-Bus control interface. Default: false.
   noDbus = false;
+
+  # Auto-open/close mic when PipeWire clients connect/disconnect.
+  micOnDemand = true;
 };
 ```
 

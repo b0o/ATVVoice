@@ -12,7 +12,7 @@ Target remotes: G20S Pro and any ATVV-compatible remote following the Google Ref
 BLE Remote <--[BlueZ/D-Bus/GATT]--> atvvoice daemon --[PipeWire virtual source]--> Apps
 ```
 
-Nine modules:
+Ten modules:
 
 | Module            | File                     | Responsibility                                                         |
 | ----------------- | ------------------------ | ---------------------------------------------------------------------- |
@@ -25,6 +25,7 @@ Nine modules:
 | ADPCM Decoder     | `src/adpcm.rs`           | Stateful `AdpcmDecoder` struct + post-processing (declip, lowpass, gain) |
 | PipeWire Source   | `src/pw.rs`              | Virtual audio source node (own thread, not async)                      |
 | D-Bus Control     | `src/dbus.rs`            | Session bus interface for external mic control (optional feature)       |
+| Consumer Events   | `src/consumer.rs`        | `ConsumerEvent` type for PipeWire consumer presence notifications      |
 | CLI / Main        | `src/main.rs`            | CLI parsing, `negotiate()`, tokio runtime, reconnect loop, signal handling |
 
 ## Tech Stack
@@ -166,6 +167,8 @@ tokio (single-threaded) ──────────────────�
 
 13. **Protocol version is auto-negotiated.** GET_CAPS always sends v1.0 (our max version). The remote's CAPS_RESP version field determines which protocol implementation is used. v0.4 remotes tolerate the extra interaction_models byte in v1.0 GET_CAPS. The `--protocol-version` CLI flag was removed.
 
+14. **`--mic-on-demand` monitors PipeWire Registry links.** Node ID is captured asynchronously in `state_changed` (not available immediately after `connect()`). Link properties (`link.output.node`, `link.input.node`) are strings that must be parsed to u32. Consumer events use `tokio::sync::mpsc` with `try_send()` from the PW thread.
+
 ## Development Environment
 
 - **User:** `boo` on NixOS
@@ -184,7 +187,7 @@ cargo test                                                                # Run 
 cargo test adpcm                                                          # Run ADPCM decoder tests only
 cargo build                                                               # Debug build
 cargo run -- -d AA:BB:CC:DD:EE:FF -v                                      # Run with test remote
-cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5 --idle-timeout 300 # With timeouts
+cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5                    # With timeouts
 nix build                                                                 # Nix build
 ```
 
@@ -195,7 +198,7 @@ nix develop --command cargo check                                               
 nix develop --command cargo test                                                                # Run all tests
 nix develop --command cargo clippy --tests -- -W clippy::all                                    # Lint
 nix develop --command cargo run -- -d AA:BB:CC:DD:EE:FF -v                                      # Run with test remote
-nix develop --command cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5 --idle-timeout 300 # With timeouts
+nix develop --command cargo run -- -d AA:BB:CC:DD:EE:FF -v --frame-timeout 5                    # With timeouts
 nix build                                                                                       # Nix build
 ```
 

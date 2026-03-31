@@ -20,6 +20,7 @@ use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Object, Pod, Value};
 use pipewire::spa::utils::{Direction, SpaTypes};
 use pipewire::stream::{Stream, StreamFlags, StreamRc};
+use pipewire::types::ObjectType;
 
 /// Number of audio channels (mono).
 const CHANNELS: u32 = 1;
@@ -44,6 +45,7 @@ pub fn run_pw_source(
     node_name: &str,
     node_description: &str,
     shutdown_rx: pipewire::channel::Receiver<Shutdown>,
+    consumer_tx: Option<tokio::sync::mpsc::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
@@ -67,6 +69,7 @@ pub fn run_pw_source(
 
     let context = ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
+    let core_clone = core.clone(); // Keep a clone for registry creation later
 
     let stream = StreamRc::new(
         core,
@@ -94,10 +97,29 @@ pub fn run_pw_source(
     /// Maximum pending samples before overflow truncation (~500ms at 16kHz).
     const MAX_PENDING: usize = 8000;
 
+    // Track our PipeWire node ID once the stream reaches Paused/Streaming.
+    let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
+        std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
+
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .state_changed(|_, _, old, new| {
-            tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
+        .state_changed({
+            let our_node_id = our_node_id.clone();
+            let stream_for_id = stream.clone();
+            move |_, _, old, new| {
+                tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
+                if matches!(
+                    new,
+                    pipewire::stream::StreamState::Paused
+                        | pipewire::stream::StreamState::Streaming
+                ) {
+                    let id = stream_for_id.node_id();
+                    if id != u32::MAX {
+                        our_node_id.set(id);
+                        tracing::debug!("PipeWire node ID: {id}");
+                    }
+                }
+            }
         })
         .process(move |stream: &Stream, _| {
             // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
@@ -205,6 +227,184 @@ pub fn run_pw_source(
         "PipeWire source running ({}kHz S16LE mono, gain={gain_db}dB)",
         sample_rate / 1000
     );
+
+    // Registry link monitoring for --mic-on-demand.
+    //
+    // Tracks PipeWire Link objects that connect to our stream node. Excludes
+    // passive links (pavucontrol peak meters, level meters) so they don't
+    // trigger mic open or hold it open.
+    //
+    // Detection uses bound Link proxies: the registry global props don't include
+    // `link.passive`, but the Link proxy's `info` event does. When a link to our
+    // node appears, we bind its proxy and wait for the info callback to determine
+    // if it's passive. This handles the race where link globals arrive before
+    // their full properties are available.
+    //
+    // Detection: for each link to our node, we bind the OTHER node's proxy and
+    // check its full info properties for `node.want-driver == "true"`. The
+    // registry global only shows a subset of node properties; the bound Node
+    // proxy's `info` event includes everything — specifically `stream.monitor`
+    // which is set on peak detect streams (pavucontrol) but not real consumers.
+    #[allow(clippy::type_complexity)]
+    let (_registry, _registry_listener, _proxies) = if let Some(consumer_tx) = consumer_tx {
+        let registry = core_clone.get_registry_rc()?;
+
+        // Links to our node: link_id → other_node_id.
+        let our_links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, u32>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        // Whether each Stream/Input/Audio node is a monitor (from bound Node info).
+        // true = monitor (don't count), false = real consumer.
+        // Nodes not yet in the map haven't received info yet — treated as "not
+        // monitor" so real consumers work before info arrives.
+        let node_is_monitor: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, bool>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        // Last emitted consumer count (to avoid duplicate events).
+        let last_count: std::rc::Rc<std::cell::Cell<u32>> =
+            std::rc::Rc::new(std::cell::Cell::new(0));
+        // Bound proxies (must stay alive): link proxies + node proxies with listeners.
+        let proxies: std::rc::Rc<
+            std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+
+        // Count links where the other node is NOT a monitor. Emit Changed if count changed.
+        let recount = {
+            let our_links = our_links.clone();
+            let node_is_monitor = node_is_monitor.clone();
+            let last_count = last_count.clone();
+            let consumer_tx = consumer_tx.clone();
+            move || {
+                let links = our_links.borrow();
+                let monitors = node_is_monitor.borrow();
+                let count = links
+                    .values()
+                    .filter(|other_node| monitors.get(other_node) != Some(&true))
+                    .count() as u32;
+                if count != last_count.get() {
+                    last_count.set(count);
+                    tracing::debug!("PipeWire consumer count: {count}");
+                    let _ = consumer_tx.try_send(crate::consumer::ConsumerEvent::Changed(count));
+                }
+            }
+        };
+
+        let listener = registry
+            .add_listener_local()
+            .global({
+                let our_node_id = our_node_id.clone();
+                let our_links = our_links.clone();
+                let node_is_monitor = node_is_monitor.clone();
+                let proxies = proxies.clone();
+                let registry = registry.clone();
+                let recount = recount.clone();
+                move |global| {
+                    match global.type_ {
+                        ObjectType::Node => {
+                            // Bind Stream/Input/Audio nodes to get their full info.
+                            let dominated_by_pulse =
+                                global.props.as_ref().and_then(|p| p.get("media.class"))
+                                    == Some("Stream/Input/Audio");
+                            if !dominated_by_pulse {
+                                return;
+                            }
+                            let node_id = global.id;
+                            let Ok(node) = registry.bind::<pipewire::node::Node, _>(global) else {
+                                return;
+                            };
+                            let node_listener = node
+                                .add_listener_local()
+                                .info({
+                                    let node_is_monitor = node_is_monitor.clone();
+                                    let recount = recount.clone();
+                                    move |info| {
+                                        let is_monitor =
+                                            info.props().and_then(|p| p.get("stream.monitor"))
+                                                == Some("true");
+                                        let mut map = node_is_monitor.borrow_mut();
+                                        let was_monitor =
+                                            map.get(&node_id).copied().unwrap_or(false);
+                                        if is_monitor && !was_monitor {
+                                            // Sticky: once classified as monitor, stays monitor.
+                                            // stream.monitor flickers during PW reconfiguration
+                                            // but a peak detect stream never becomes a real consumer.
+                                            tracing::debug!(
+                                                "PipeWire node (id={node_id}) classified as monitor"
+                                            );
+                                            map.insert(node_id, true);
+                                            drop(map);
+                                            recount();
+                                        } else if let std::collections::hash_map::Entry::Vacant(e) =
+                                            map.entry(node_id)
+                                        {
+                                            // First info: not a monitor stream.
+                                            e.insert(false);
+                                            drop(map);
+                                            recount();
+                                        }
+                                    }
+                                })
+                                .register();
+                            proxies
+                                .borrow_mut()
+                                .insert(node_id, Box::new((node, node_listener)));
+                        }
+                        ObjectType::Link => {
+                            let our_id = our_node_id.get();
+                            if our_id == u32::MAX {
+                                return;
+                            }
+                            let Some(props) = &global.props else {
+                                return;
+                            };
+                            let output_node = props
+                                .get("link.output.node")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let input_node = props
+                                .get("link.input.node")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            if output_node != Some(our_id) && input_node != Some(our_id) {
+                                return;
+                            }
+                            let other_node = if output_node == Some(our_id) {
+                                input_node
+                            } else {
+                                output_node
+                            };
+                            let Some(other_id) = other_node else { return };
+
+                            let link_id = global.id;
+                            tracing::debug!(
+                                "PipeWire link to our node (id={link_id}, other_node={other_id})"
+                            );
+                            our_links.borrow_mut().insert(link_id, other_id);
+                            // Recount — if node info is already cached, this will
+                            // immediately include or exclude the link. If not yet
+                            // cached, the node's info callback will trigger recount.
+                            recount();
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .global_remove({
+                let our_links = our_links.clone();
+                let node_is_monitor = node_is_monitor.clone();
+                let proxies = proxies.clone();
+                let recount = recount.clone();
+                move |id| {
+                    proxies.borrow_mut().remove(&id);
+                    let had_link = our_links.borrow_mut().remove(&id).is_some();
+                    let had_node = node_is_monitor.borrow_mut().remove(&id).is_some();
+                    if had_link || had_node {
+                        recount();
+                    }
+                }
+            })
+            .register();
+
+        (Some(registry), Some(listener), Some(proxies))
+    } else {
+        (None, None, None)
+    };
 
     // Block until quit.
     mainloop.run();
