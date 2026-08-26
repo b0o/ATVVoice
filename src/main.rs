@@ -280,6 +280,17 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        // Perform vendor handshake if the device requires one (e.g. Philips TV Voice remotes).
+        // Keep the returned stream alive: dropping it calls StopNotify on ff02,
+        // which resets the remote's ATVV-ready state before GET_CAPS can succeed.
+        let mut _vendor_ff02_stream = match ble::vendor_handshake(&device).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!("Vendor handshake failed: {e}");
+                None
+            }
+        };
+
         // Derive instance names from device.
         let ble_name = device.name().await.ok().flatten().unwrap_or_default();
         let suffix = cli.name.clone().unwrap_or_else(|| {
@@ -507,12 +518,22 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Re-resolve characteristics (handles may change after reconnect)
+            // Also re-run vendor handshake since some devices (e.g. Philips) reset their
+            // ATVV-ready state on reconnect.
             chars = loop {
                 tokio::select! {
                     result = ble::resolve_chars(&device) => {
                         match result {
                             Ok(c) => {
                                 tracing::info!("ATVV characteristics re-resolved");
+                                // Re-run vendor handshake (e.g. Philips remotes reset state on reconnect)
+                                _vendor_ff02_stream = match ble::vendor_handshake(&device).await {
+                                    Ok(stream) => stream,
+                                    Err(e) => {
+                                        tracing::warn!("Vendor handshake failed after reconnect: {e}");
+                                        None
+                                    }
+                                };
                                 break c;
                             }
                             Err(e) => {
