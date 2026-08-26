@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bluer::{gatt::remote::Characteristic, Adapter, AdapterEvent, Address, Device, Uuid};
+use bluer::{gatt::{remote::Characteristic, WriteOp}, Adapter, AdapterEvent, Address, Device, Uuid};
 use futures::{Stream, StreamExt};
 
 use crate::atvv::{BleDevice, BleFut, BleStream, DeviceConnectionEvent};
@@ -74,7 +74,14 @@ impl BleDevice for BluerDevice<'_> {
     fn write_command(&self, data: &[u8]) -> BleFut<'_, ()> {
         let data = data.to_vec();
         Box::pin(async move {
-            self.chars.tx.write(&data).await?;
+            // TX characteristic has the 'write' flag (not 'write-without-response'),
+            // so we must use ATT Write Request (WriteOp::Request) instead of the
+            // default WriteOp::Command (ATT Write Command). Remotes silently ignore
+            // Write Commands on characteristics that only support Write Request.
+            self.chars.tx.write_ext(&data, &bluer::gatt::remote::CharacteristicWriteRequest {
+                op_type: WriteOp::Request,
+                ..Default::default()
+            }).await?;
             Ok(())
         })
     }
@@ -223,7 +230,7 @@ pub async fn resolve_chars(device: &Device) -> Result<AtvvChars> {
 /// and responds to GET_CAPS commands.
 ///
 /// Returns `Ok(true)` if the handshake was performed, `Ok(false)` if not a Philips device.
-pub async fn vendor_handshake(device: &Device) -> Result<bool> {
+pub async fn vendor_handshake(device: &Device) -> Result<Option<crate::atvv::BleStream<Vec<u8>>>> {
     let mut ff01_char = None;
     let mut ff02_char = None;
 
@@ -245,18 +252,20 @@ pub async fn vendor_handshake(device: &Device) -> Result<bool> {
 
     let ff01 = match ff01_char {
         Some(c) => c,
-        None => return Ok(false), // Not a Philips device
+        None => return Ok(None), // Not a Philips device
     };
 
     tracing::info!("Detected Philips vendor service. Performing vendor handshake...");
 
     // Step 1: Subscribe to ff02 (required before remote accepts ff01 write).
     // The remote sends "ntf_enable" on ff02 as a greeting when subscribed.
-    let _ff02_stream = if let Some(ff02) = ff02_char {
+    // We return this stream to the caller so it stays subscribed for the session —
+    // dropping it (StopNotify) resets the remote's ATVV-ready state.
+    let ff02_stream: Option<crate::atvv::BleStream<Vec<u8>>> = if let Some(ff02) = ff02_char {
         match ff02.notify().await {
             Ok(stream) => {
                 tracing::debug!("Subscribed to vendor ff02 notifications");
-                Some(stream)
+                Some(Box::pin(stream))
             }
             Err(e) => {
                 tracing::warn!("Vendor ff02 StartNotify failed (continuing): {e}");
@@ -269,14 +278,17 @@ pub async fn vendor_handshake(device: &Device) -> Result<bool> {
     };
 
     // Step 2: Write "ntf_enable" to ff01 to signal readiness.
-    ff01.write(b"ntf_enable").await
-        .context("Philips vendor handshake: write to ff01 failed")?;
+    ff01.write_ext(b"ntf_enable", &bluer::gatt::remote::CharacteristicWriteRequest {
+        op_type: WriteOp::Request,
+        ..Default::default()
+    }).await.context("Philips vendor handshake: write to ff01 failed")?;
     tracing::debug!("Vendor handshake: wrote ntf_enable to ff01");
 
     // Step 3: Wait for remote to process and enter ATVV-ready state.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     tracing::info!("Vendor handshake complete");
-    // _ff02_stream dropped here → StopNotify called automatically
-    Ok(true)
+    // Return the ff02 stream so the caller can hold it alive for the session.
+    // Dropping it would call StopNotify and reset the remote's ATVV-ready state.
+    Ok(ff02_stream)
 }
