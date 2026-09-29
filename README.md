@@ -8,6 +8,7 @@ Linux daemon that captures voice audio from BLE TV remotes using the [Android TV
 |--------|--------|
 | G20S Pro / G20S Pro Plus / G20BTS Plus | Verified working |
 | Philips URMT26RST004 (TV Voice RC_5) | Verified working |
+| TCL BT_RC833A_B5 | Verified working |
 | Other ATVV-compatible remotes | Unknown |
 
 If you have a remote you'd like to test, open an issue with the device name, Bluetooth address, and output of `atvvoice -d <ADDR> -vv`. See [docs/research/report.md](docs/research/report.md) for protocol details.
