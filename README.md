@@ -6,6 +6,7 @@ Linux daemon that captures voice audio from BLE TV remotes using the [Android TV
 
 | Device | Status |
 |--------|--------|
+| Chromecast Voice Remote (G9N9N) | Verified working |
 | G20S Pro / G20S Pro Plus / G20BTS Plus | Verified working |
 | Philips URMT26RST004 (TV Voice RC_5) | Verified working |
 | TCL BT_RC833A_B5 | Verified working |
