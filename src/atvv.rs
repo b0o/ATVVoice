@@ -33,6 +33,9 @@ impl std::fmt::Display for State {
 /// `MIC_OPEN` stream instead of streaming only while held.
 const HTT_HOLD_THRESHOLD: Duration = Duration::from_millis(550);
 
+// Some HTT remotes acknowledge MIC_OPEN but only send audio while held.
+const HTT_TAP_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// A physical mic press on a hold-to-talk remote, from its
 /// `AUDIO_START(HoldToTalk)` until `AUDIO_STOP(HttButtonRelease)`.
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +139,7 @@ pub async fn run_session(
         mic_on_demand,
     } = config;
     let mut state = State::Connected;
+    let mut tap_waiting_for_audio = false;
 
     // set_state takes &mut State as a parameter rather than capturing it because
     // `state` is used independently in the tokio::select! branches below. Capturing
@@ -157,6 +161,7 @@ pub async fn run_session(
             set_state(State::Connected, &mut $state);
             $last_seq = None;
             $current_stream_id = None;
+            tap_waiting_for_audio = false;
         };
     }
 
@@ -192,6 +197,9 @@ pub async fn run_session(
     tokio::pin!(frame_timer);
     let frame_timeout_enabled = !timeouts.frame_timeout.is_zero();
 
+    let tap_frame_timer = time::sleep(HTT_TAP_FIRST_FRAME_TIMEOUT);
+    tokio::pin!(tap_frame_timer);
+
     loop {
         tokio::select! {
             Some(data) = ctl_stream.next() => {
@@ -211,6 +219,8 @@ pub async fn run_session(
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (HTT tap)");
                             set_state(State::Opening, &mut state);
+                            tap_waiting_for_audio = true;
+                            tap_frame_timer.as_mut().reset(Instant::now() + HTT_TAP_FIRST_FRAME_TIMEOUT);
                             if frame_timeout_enabled {
                                 frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
                             }
@@ -252,6 +262,7 @@ pub async fn run_session(
                             stream_starting = true;
                         }
                         if reason == AudioStartReason::HoldToTalk {
+                            tap_waiting_for_audio = false;
                             htt_press = Some(HttPress {
                                 began: Instant::now(),
                                 was_open: state == State::Streaming || state == State::Opening,
@@ -308,6 +319,7 @@ pub async fn run_session(
                         if state == State::Opening {
                             set_state(State::Connected, &mut state);
                             current_stream_id = None;
+                            tap_waiting_for_audio = false;
                         }
                     }
                     CtlEvent::Unknown(ref raw) => {
@@ -318,6 +330,7 @@ pub async fn run_session(
             Some(data) = rx_stream.next() => {
                 if state == State::Streaming {
                     if let Some(mut frame) = protocol.decode_audio(&data) {
+                        tap_waiting_for_audio = false;
                         frame.stream_start = std::mem::take(&mut stream_starting);
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
@@ -422,6 +435,12 @@ pub async fn run_session(
                 tracing::debug!("Sending keepalive");
                 let _ = ble.write_command(&protocol.keepalive_cmd(sid)).await;
                 keepalive_timer.as_mut().reset(Instant::now() + keepalive_interval);
+            }
+            () = &mut tap_frame_timer, if tap_waiting_for_audio => {
+                tracing::warn!("No audio after HTT tap ({:?}), closing mic; this remote may require holding the button", HTT_TAP_FIRST_FRAME_TIMEOUT);
+                let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
+                ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                close_mic_reset!(state, last_seq, current_stream_id);
             }
             () = &mut frame_timer, if frame_timeout_enabled && (state == State::Streaming || state == State::Opening) => {
                 tracing::info!("Frame timeout ({:?}) - device likely asleep, closing mic", timeouts.frame_timeout);
@@ -1624,6 +1643,83 @@ mod tests {
     }
 
     const V10_MIC_OPEN: &[u8] = &[0x0C, 0x00];
+
+    #[tokio::test]
+    async fn test_htt_tap_without_audio_closes_and_allows_next_hold() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        // Invalid RX data must not count as a first audio frame.
+        s.ctrl.rx_tx.send(vec![]).unwrap();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        s.expect_state(State::Streaming).await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+        s.expect_state(State::Connected).await;
+        assert_eq!(s.commands().await, vec![vec![0x0D, 0x00]]);
+
+        s.press(0x03, Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        assert!(s.commands().await.is_empty());
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_tap_without_audio_start_closes() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        s.expect_state(State::Opening).await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        s.expect_state(State::Connected).await;
+        assert_eq!(s.commands().await, vec![vec![0x0D, 0x00]]);
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_tap_first_frame_or_new_hold_cancels_start_timeout() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.ctrl.rx_tx.send(vec![0x11; 160]).unwrap();
+        s.audio_rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+
+        s.press(0x03, Duration::from_millis(150)).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        s.press(0x04, Duration::from_millis(150)).await;
+        s.release().await;
+        s.commands().await;
+        // A new physical hold replaces the pending host-opened stream.
+        s.press(0x05, Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        assert!(s.commands().await.is_empty());
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        s.finish().await;
+    }
 
     #[tokio::test]
     async fn test_htt_start_search_during_press_does_not_close_mic() {
