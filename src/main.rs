@@ -85,6 +85,22 @@ fn sanitize_name(s: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
+/// Derive the instance name suffix from the remote's advertised name.
+///
+/// Falls back to the Bluetooth address when the name yields no usable
+/// characters, which happens for names that are entirely non-ASCII (e.g.
+/// `小米蓝牙语音遥控器`). The address is prefixed with `dev-` because a D-Bus
+/// name element may not begin with a digit, and an address like `47:54:…`
+/// sanitises to one that does.
+fn instance_suffix(ble_name: &str, address: &str) -> String {
+    let from_name = sanitize_name(ble_name);
+    if from_name.is_empty() {
+        format!("dev-{}", sanitize_name(address))
+    } else {
+        from_name
+    }
+}
+
 /// Wait for device to be connected, using event stream if possible.
 async fn ensure_connected(device: &bluer::Device) {
     match device.is_connected().await {
@@ -293,13 +309,10 @@ async fn main() -> anyhow::Result<()> {
 
         // Derive instance names from device.
         let ble_name = device.name().await.ok().flatten().unwrap_or_default();
-        let suffix = cli.name.clone().unwrap_or_else(|| {
-            if !ble_name.is_empty() {
-                sanitize_name(&ble_name)
-            } else {
-                sanitize_name(&device.address().to_string())
-            }
-        });
+        let suffix = cli
+            .name
+            .clone()
+            .unwrap_or_else(|| instance_suffix(&ble_name, &device.address().to_string()));
         let node_name = format!("atvvoice-{suffix}");
         #[allow(unused_variables)]
         let dbus_name = format!("org.atvvoice.{suffix}");
@@ -554,4 +567,48 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{instance_suffix, sanitize_name};
+
+    #[test]
+    fn sanitize_name_replaces_spaces_with_hyphens() {
+        assert_eq!(sanitize_name("Chromecast Remote"), "chromecast-remote");
+    }
+
+    #[test]
+    fn sanitize_name_drops_all_non_ascii() {
+        assert_eq!(sanitize_name("小米蓝牙语音遥控器"), "");
+    }
+
+    #[test]
+    fn sanitize_name_keeps_ascii_from_mixed_name() {
+        assert_eq!(sanitize_name("小米 Remote 2"), "remote-2");
+    }
+
+    #[test]
+    fn instance_suffix_prefers_the_device_name() {
+        assert_eq!(
+            instance_suffix("Chromecast Remote", "47:54:51:48:DA:A1"),
+            "chromecast-remote"
+        );
+    }
+
+    #[test]
+    fn instance_suffix_falls_back_to_the_address() {
+        assert_eq!(
+            instance_suffix("小米蓝牙语音遥控器", "47:54:51:48:DA:A1"),
+            "dev-47-54-51-48-da-a1"
+        );
+    }
+
+    #[test]
+    fn instance_suffix_falls_back_when_the_name_is_missing() {
+        assert_eq!(
+            instance_suffix("", "47:54:51:48:DA:A1"),
+            "dev-47-54-51-48-da-a1"
+        );
+    }
 }
