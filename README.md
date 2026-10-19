@@ -96,7 +96,7 @@ atvvoice [OPTIONS]
 |------|---------|-------------|
 | `-d, --device` | auto | Bluetooth address of remote. Auto-detects first ATVV device if omitted. |
 | `-a, --adapter` | auto | BlueZ adapter name |
-| `-g, --gain` | 20 | Audio gain in dB |
+| `-g, --gain` | 8 | Audio gain in dB |
 | `--frame-timeout` | 5 | Seconds without frames before auto-closing mic (device asleep). 0 = disabled. |
 | `--keep-alive` | 10 | Seconds between keepalive messages to prevent the remote's audio transfer timeout. 0 = disabled. See [Audio keepalive](#audio-keepalive). |
 | `-n, --name` | | Instance name suffix. Sets PW node and D-Bus name (e.g. `--name living-room`). |
@@ -182,8 +182,8 @@ services.atvvoice = {
   # BlueZ adapter name. null (default) = auto-detect.
   adapter = null;
 
-  # Audio gain in dB. null (default) = 20.
-  gain = 20;
+  # Audio gain in dB. null (default) = 8.
+  gain = 8;
 
   # Seconds without audio frames before auto-closing mic. 0 = disabled.
   # null (default) = 5.

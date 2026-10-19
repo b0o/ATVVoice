@@ -37,8 +37,8 @@ struct Cli {
     #[arg(short, long)]
     adapter: Option<String>,
 
-    /// Audio gain in dB (default: 20)
-    #[arg(short, long, default_value = "20")]
+    /// Audio gain in dB (default: 8)
+    #[arg(short, long, default_value = "8")]
     gain: f32,
 
     /// High-pass cutoff in Hz to remove the mic's DC offset and start-of-stream "pop". 0 = disabled.
@@ -618,4 +618,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn default_gain_is_8_db() {
+        assert_eq!(Cli::parse_from(["atvvoice"]).gain, 8.0);
+    }
 }
