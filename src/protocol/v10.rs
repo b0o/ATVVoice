@@ -176,6 +176,7 @@ impl Protocol for ProtocolV10 {
                 .selected_codec
                 .expect("codec must be negotiated before decode"),
             samples,
+            stream_start: false,
         })
     }
 
@@ -201,6 +202,15 @@ impl Protocol for ProtocolV10 {
                 self.frame_seq = *seq;
             }
         }
+    }
+
+    fn on_audio_start(&mut self) {
+        // The remote restarts its frame numbering and encoder on every stream and normally
+        // follows with AUDIO_SYNC(seq 0, predictor 0, step 0). Apply that state now so that a
+        // missing first sync costs nothing: AUDIO_START and AUDIO_SYNC share the CTL
+        // characteristic, so the real sync can only arrive after this and still wins.
+        self.decoder.reset(0, 0);
+        self.frame_seq = 0;
     }
 }
 
@@ -360,6 +370,22 @@ mod tests {
         assert_eq!(p.decoder.predictor(), 500);
         assert_eq!(p.decoder.step_index(), 30);
         assert_eq!(p.frame_seq, 42);
+    }
+
+    #[test]
+    fn test_on_audio_start_resets_stream_state() {
+        // A new stream must not inherit the previous stream's frame counter or
+        // decoder state when its AUDIO_SYNC(seq 0) goes missing.
+        let mut p = ProtocolV10::new();
+        p.selected_codec = Some(Codec::Adpcm16kHz);
+        p.audio_frame_size = AudioFrameSize(20);
+        p.decoder.reset(1234, 40);
+        p.frame_seq = 13;
+        p.on_audio_start();
+        assert_eq!(p.decoder.predictor(), 0);
+        assert_eq!(p.decoder.step_index(), 0);
+        let af = p.decode_audio(&[0u8; 20]).unwrap();
+        assert_eq!(af.seq, 0);
     }
 
     #[test]

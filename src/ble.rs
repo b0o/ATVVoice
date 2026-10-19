@@ -4,7 +4,10 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bluer::{gatt::{remote::Characteristic, WriteOp}, Adapter, AdapterEvent, Address, Device, Uuid};
+use bluer::{
+    gatt::{remote::Characteristic, CharacteristicFlags, WriteOp},
+    Adapter, AdapterEvent, Address, Device, Uuid,
+};
 use futures::{Stream, StreamExt};
 
 use crate::atvv::{BleDevice, BleFut, BleStream, DeviceConnectionEvent};
@@ -48,6 +51,8 @@ const PHILIPS_VENDOR_FF02: Uuid = Uuid::from_u128(0x02f00000_0000_0000_0000_0000
 /// Resolved ATVV characteristics for a connected device.
 pub struct AtvvChars {
     pub tx: Characteristic,
+    /// ATT operation for TX writes, chosen from the TX characteristic's flags.
+    pub tx_write_op: WriteOp,
     pub rx: Characteristic,
     pub ctl: Characteristic,
 }
@@ -56,6 +61,7 @@ impl std::fmt::Debug for AtvvChars {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtvvChars")
             .field("tx", &"<Characteristic>")
+            .field("tx_write_op", &self.tx_write_op)
             .field("rx", &"<Characteristic>")
             .field("ctl", &"<Characteristic>")
             .finish()
@@ -74,23 +80,28 @@ impl BleDevice for BluerDevice<'_> {
     fn write_command(&self, data: &[u8]) -> BleFut<'_, ()> {
         let data = data.to_vec();
         Box::pin(async move {
-            // TX characteristic has the 'write' flag (not 'write-without-response'),
-            // so we must use ATT Write Request (WriteOp::Request) instead of the
-            // default WriteOp::Command (ATT Write Command). Remotes silently ignore
-            // Write Commands on characteristics that only support Write Request.
-            self.chars.tx.write_ext(&data, &bluer::gatt::remote::CharacteristicWriteRequest {
-                op_type: WriteOp::Request,
-                ..Default::default()
-            }).await?;
+            // See `tx_write_op`: Write Request where the TX characteristic
+            // supports it, Write Command where it only has write-without-response.
+            self.chars
+                .tx
+                .write_ext(
+                    &data,
+                    &bluer::gatt::remote::CharacteristicWriteRequest {
+                        op_type: self.chars.tx_write_op,
+                        ..Default::default()
+                    },
+                )
+                .await?;
             Ok(())
         })
     }
 
     fn ctl_notifications(&self) -> BleFut<'_, BleStream<Vec<u8>>> {
         Box::pin(async {
-            let reader = self.chars.ctl.notify_io().await
-                .context("Failed to acquire exclusive CTL notifications. \
-                          Another ATVVoice instance may be connected to this device.")?;
+            let reader = self.chars.ctl.notify_io().await.context(
+                "Failed to acquire exclusive CTL notifications. \
+                          Another ATVVoice instance may be connected to this device.",
+            )?;
             tracing::debug!("CTL AcquireNotify: exclusive access, MTU={}", reader.mtu());
             Ok(reader_to_stream(reader))
         })
@@ -98,9 +109,10 @@ impl BleDevice for BluerDevice<'_> {
 
     fn rx_notifications(&self) -> BleFut<'_, BleStream<Vec<u8>>> {
         Box::pin(async {
-            let reader = self.chars.rx.notify_io().await
-                .context("Failed to acquire exclusive RX notifications. \
-                          Another ATVVoice instance may be connected to this device.")?;
+            let reader = self.chars.rx.notify_io().await.context(
+                "Failed to acquire exclusive RX notifications. \
+                          Another ATVVoice instance may be connected to this device.",
+            )?;
             tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", reader.mtu());
             Ok(reader_to_stream(reader))
         })
@@ -110,18 +122,36 @@ impl BleDevice for BluerDevice<'_> {
         Box::pin(async {
             let stream = self.device.events().await?;
             let mapped = stream.filter_map(|event| async move {
-                if let bluer::DeviceEvent::PropertyChanged(
-                    bluer::DeviceProperty::Connected(false),
-                ) = event
+                if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(
+                    false,
+                )) = event
                 {
                     Some(DeviceConnectionEvent::Disconnected)
                 } else {
                     None
                 }
             });
-            Ok(
-                Box::pin(mapped) as BleStream<DeviceConnectionEvent>,
-            )
+            // When the adapter re-enumerates (e.g. across suspend) the device object vanishes and the
+            // event stream just goes quiet, so poll too: a failing or false is_connected() is a disconnect.
+            let device = self.device.clone();
+            let polled = futures::stream::unfold(device, |device| async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match device.is_connected().await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "is_connected() poll failed, device object is gone: {e}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Some((DeviceConnectionEvent::Disconnected, device))
+            });
+            Ok(Box::pin(futures::stream::select(mapped, polled))
+                as BleStream<DeviceConnectionEvent>)
         })
     }
 }
@@ -137,6 +167,77 @@ fn should_skip(addr: Address, filter_addr: Option<Address>, excluded: &[Address]
         }
     }
     false
+}
+
+/// What adapter selection needs to know about one BlueZ adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterInfo {
+    pub name: String,
+    pub address: Address,
+    /// Whether the remote given with `--device` is paired on this adapter.
+    pub has_paired_device: bool,
+}
+
+/// Pick the adapter to use: `requested` by name (`hci1`) or address, else the one the remote is paired on.
+/// `Ok(None)` means "use BlueZ's default adapter". Adapter names can swap between boots or re-plugs, so
+/// with several adapters the pairing (or an address) is the stable way to find the right one.
+pub fn choose_adapter(adapters: &[AdapterInfo], requested: Option<&str>) -> Result<Option<String>> {
+    if let Some(wanted) = requested {
+        let by_address: Option<Address> = wanted.parse().ok();
+        return adapters
+            .iter()
+            .find(|a| a.name == wanted || Some(a.address) == by_address)
+            .map(|a| Some(a.name.clone()))
+            .with_context(|| format!("no Bluetooth adapter named or addressed {wanted:?}"));
+    }
+    Ok(adapters
+        .iter()
+        .find(|a| a.has_paired_device)
+        .map(|a| a.name.clone()))
+}
+
+/// Resolve the adapter from `--adapter` / `--device` (see `choose_adapter`).
+pub async fn select_adapter(
+    session: &bluer::Session,
+    requested: Option<&str>,
+    device: Option<Address>,
+) -> Result<Adapter> {
+    let mut waiting = false;
+    loop {
+        let mut adapters = Vec::new();
+        for name in session.adapter_names().await? {
+            let adapter = session.adapter(&name)?;
+            let has_paired_device = match device {
+                Some(addr) => match adapter.device(addr) {
+                    Ok(dev) => dev.is_paired().await.unwrap_or(false),
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            adapters.push(AdapterInfo {
+                name,
+                address: adapter.address().await?,
+                has_paired_device,
+            });
+        }
+        match choose_adapter(&adapters, requested)? {
+            Some(name) => return Ok(session.adapter(&name)?),
+            // A given remote that no adapter has paired yet: its adapter is probably still coming up
+            // (a USB dongle re-enumerating after suspend). Wait for it instead of settling on the default
+            // adapter, where a bonded-only daemon would wait for that remote forever.
+            None if device.is_some() && requested.is_none() => {
+                if !waiting {
+                    tracing::info!(
+                        "Device {} is not paired on any adapter yet; waiting for its adapter...",
+                        device.expect("checked is_some")
+                    );
+                    waiting = true;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            None => return Ok(session.default_adapter().await?),
+        }
+    }
 }
 
 /// Find a bonded device that advertises the ATVV service.
@@ -184,7 +285,24 @@ pub async fn find_atvv_device(
         }
     }
 
-    anyhow::bail!("BLE discovery stream ended without finding an ATVV device (adapter may have been removed)")
+    anyhow::bail!(
+        "BLE discovery stream ended without finding an ATVV device (adapter may have been removed)"
+    )
+}
+
+/// Pick the ATT write operation for the TX characteristic.
+///
+/// Remotes silently discard an ATT Write Command sent to a characteristic that
+/// only has the `write` property (e.g. Philips URMT26RST004), while others
+/// reject an ATT Write Request when TX only has `write-without-response`
+/// (e.g. Chromecast Voice Remote: "Write not permitted"). Prefer Write Request
+/// when allowed, otherwise fall back to Write Command.
+fn tx_write_op(flags: &CharacteristicFlags) -> WriteOp {
+    if flags.write || !flags.write_without_response {
+        WriteOp::Request
+    } else {
+        WriteOp::Command
+    }
 }
 
 /// Resolve the three ATVV GATT characteristics from a connected device.
@@ -209,8 +327,13 @@ pub async fn resolve_chars(device: &Device) -> Result<AtvvChars> {
         break; // Found the ATVV service; no need to check other services.
     }
 
+    let tx: Characteristic = tx.context("ATVV TX characteristic not found")?;
+    let tx_write_op = tx_write_op(&tx.flags().await?);
+    tracing::debug!("TX write op: {:?}", tx_write_op);
+
     Ok(AtvvChars {
-        tx: tx.context("ATVV TX characteristic not found")?,
+        tx,
+        tx_write_op,
         rx: rx.context("ATVV RX characteristic not found")?,
         ctl: ctl.context("ATVV CTL characteristic not found")?,
     })
@@ -278,10 +401,15 @@ pub async fn vendor_handshake(device: &Device) -> Result<Option<crate::atvv::Ble
     };
 
     // Step 2: Write "ntf_enable" to ff01 to signal readiness.
-    ff01.write_ext(b"ntf_enable", &bluer::gatt::remote::CharacteristicWriteRequest {
-        op_type: WriteOp::Request,
-        ..Default::default()
-    }).await.context("Philips vendor handshake: write to ff01 failed")?;
+    ff01.write_ext(
+        b"ntf_enable",
+        &bluer::gatt::remote::CharacteristicWriteRequest {
+            op_type: WriteOp::Request,
+            ..Default::default()
+        },
+    )
+    .await
+    .context("Philips vendor handshake: write to ff01 failed")?;
     tracing::debug!("Vendor handshake: wrote ntf_enable to ff01");
 
     // Step 3: Wait for remote to process and enter ATVV-ready state.
@@ -291,4 +419,76 @@ pub async fn vendor_handshake(device: &Device) -> Result<Option<crate::atvv::Ble
     // Return the ff02 stream so the caller can hold it alive for the session.
     // Dropping it would call StopNotify and reset the remote's ATVV-ready state.
     Ok(ff02_stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapters() -> Vec<AdapterInfo> {
+        vec![
+            AdapterInfo {
+                name: "hci0".into(),
+                address: "48:E7:DA:72:52:94".parse().unwrap(),
+                has_paired_device: false,
+            },
+            AdapterInfo {
+                name: "hci1".into(),
+                address: "8C:68:8B:E2:A0:5F".parse().unwrap(),
+                has_paired_device: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_choose_adapter_by_name_or_address() {
+        assert_eq!(
+            choose_adapter(&adapters(), Some("hci0")).unwrap(),
+            Some("hci0".to_string())
+        );
+        assert_eq!(
+            choose_adapter(&adapters(), Some("8c:68:8b:e2:a0:5f")).unwrap(),
+            Some("hci1".to_string())
+        );
+        assert!(choose_adapter(&adapters(), Some("hci7")).is_err());
+    }
+
+    #[test]
+    fn test_choose_adapter_where_device_is_paired() {
+        assert_eq!(
+            choose_adapter(&adapters(), None).unwrap(),
+            Some("hci1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_choose_adapter_falls_back_to_default() {
+        let mut list = adapters();
+        list[1].has_paired_device = false;
+        assert_eq!(choose_adapter(&list, None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_tx_write_op_prefers_request() {
+        let flags = CharacteristicFlags {
+            write: true,
+            write_without_response: true,
+            ..Default::default()
+        };
+        assert_eq!(tx_write_op(&flags), WriteOp::Request);
+        let flags = CharacteristicFlags {
+            write: true,
+            ..Default::default()
+        };
+        assert_eq!(tx_write_op(&flags), WriteOp::Request);
+    }
+
+    #[test]
+    fn test_tx_write_op_command_when_only_write_without_response() {
+        let flags = CharacteristicFlags {
+            write_without_response: true,
+            ..Default::default()
+        };
+        assert_eq!(tx_write_op(&flags), WriteOp::Command);
+    }
 }

@@ -257,6 +257,9 @@ pub struct AudioFrame {
     pub seq: u16,
     pub codec: Codec,
     pub samples: Vec<i16>,
+    /// First frame of a new audio stream (set by the session, not the decoder), so post-processing can
+    /// reset per-stream state such as the high-pass filter and fade-in.
+    pub stream_start: bool,
 }
 
 #[cfg(test)]

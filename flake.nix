@@ -97,7 +97,7 @@
           gain = mkOption {
             type = types.nullOr types.number;
             default = null;
-            description = "Audio gain in dB. null = app default (20).";
+            description = "Audio gain in dB. null = app default (8).";
           };
 
           frameTimeout = mkOption {

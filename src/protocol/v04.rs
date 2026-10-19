@@ -183,6 +183,7 @@ impl Protocol for ProtocolV04 {
                 .selected_codec
                 .expect("codec must be negotiated before decode"),
             samples,
+            stream_start: false,
         })
     }
 

@@ -119,7 +119,7 @@ Applied after ADPCM decode, before PipeWire output:
 
 1. **Click removal (declip):** Interpolate single-sample spikes where `|cur-prev| > 1000 AND |cur-next| > 1000 AND min(dp,dn) > |next-prev| * 2`
 2. **Low-pass filter:** 3-tap triangle `[0.25, 0.5, 0.25]` - removes high-freq quantization noise
-3. **Gain:** Fixed dB gain (default 20dB ≈ 10x). Remote mic produces very low-level output.
+3. **Gain:** Fixed dB gain (default 8dB ≈ 2.51x). Remote mic produces very low-level output.
 
 ## Threading & Channel Architecture
 

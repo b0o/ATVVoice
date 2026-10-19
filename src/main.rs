@@ -24,19 +24,30 @@ const DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DECODER_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Parser)]
-#[command(name = "atvvoice", about = "ATVVoice - BLE voice remote microphone daemon")]
+#[command(
+    name = "atvvoice",
+    about = "ATVVoice - BLE voice remote microphone daemon"
+)]
 struct Cli {
     /// Filter by Bluetooth address (e.g., AA:BB:CC:DD:EE:FF)
     #[arg(short, long)]
     device: Option<String>,
 
-    /// BlueZ adapter name (default: auto-detect)
+    /// BlueZ adapter name (hci1) or address (default: the adapter the --device remote is paired on, else BlueZ's default)
     #[arg(short, long)]
     adapter: Option<String>,
 
-    /// Audio gain in dB (default: 20)
-    #[arg(short, long, default_value = "20")]
+    /// Audio gain in dB (default: 8)
+    #[arg(short, long, default_value = "8")]
     gain: f32,
+
+    /// High-pass cutoff in Hz to remove the mic's DC offset and start-of-stream "pop". 0 = disabled.
+    #[arg(long, default_value = "0")]
+    highpass: f32,
+
+    /// Fade-in at the start of each stream, in milliseconds. 0 = disabled.
+    #[arg(long, default_value = "0")]
+    fade_in: f32,
 
     /// Close mic after N seconds without audio frames (device asleep). 0 = disabled.
     #[arg(long, default_value = "5")]
@@ -85,32 +96,63 @@ fn sanitize_name(s: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
+/// Why [`ensure_connected`] returned.
+enum ConnectWait {
+    Connected,
+    /// The device's D-Bus object is gone, i.e. its adapter was removed or re-enumerated (a USB dongle
+    /// re-plugged, or powered off across suspend). Waiting on this handle would never return.
+    DeviceGone,
+}
+
 /// Wait for device to be connected, using event stream if possible.
-async fn ensure_connected(device: &bluer::Device) {
+async fn ensure_connected(device: &bluer::Device) -> ConnectWait {
     match device.is_connected().await {
-        Ok(true) => return,
-        Err(e) => tracing::warn!("is_connected() failed, assuming disconnected: {e}"),
+        Ok(true) => return ConnectWait::Connected,
+        Err(e) => {
+            tracing::warn!("is_connected() failed, device object is gone: {e}");
+            return ConnectWait::DeviceGone;
+        }
         _ => {}
     }
     tracing::info!("Waiting for device to connect...");
-    if let Ok(mut events) = device.events().await {
-        while let Some(event) = futures::StreamExt::next(&mut events).await {
-            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(true)) =
-                event
-            {
-                return;
-            }
-        }
-    }
-    // Fallback: poll
+    // Watch the Connected property, and poll alongside it: when the device object is removed the event
+    // stream may simply go quiet rather than end, and only a failing is_connected() reveals it.
+    let mut events = device.events().await.ok();
     loop {
-        tokio::time::sleep(RETRY_DELAY).await;
-        match device.is_connected().await {
-            Ok(true) => return,
-            Err(e) => tracing::warn!("is_connected() poll failed: {e}"),
-            _ => {}
+        tokio::select! {
+            event = async {
+                match events.as_mut() {
+                    Some(stream) => futures::StreamExt::next(stream).await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
+                Some(bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(true))) => {
+                    return ConnectWait::Connected;
+                }
+                Some(_) => {}
+                None => events = None, // stream ended; keep polling
+            },
+            () = tokio::time::sleep(RETRY_DELAY) => match device.is_connected().await {
+                Ok(true) => return ConnectWait::Connected,
+                Err(e) => {
+                    tracing::warn!("is_connected() poll failed, device object is gone: {e}");
+                    return ConnectWait::DeviceGone;
+                }
+                Ok(false) => {}
+            },
         }
     }
+}
+
+/// Leave with an error when the device vanished from its adapter, so the service manager restarts us and
+/// adapter selection runs again (the remote may now sit on a renamed adapter, e.g. hci1 -> hci2).
+fn gone_error(device: &bluer::Device) -> anyhow::Error {
+    anyhow::anyhow!(
+        "device {} vanished from adapter {} (adapter removed or re-enumerated, e.g. after suspend); \
+         exiting so the service restarts and selects the adapter again",
+        device.address(),
+        device.adapter_name()
+    )
 }
 
 /// Check if an error indicates the device is locked by another instance.
@@ -207,16 +249,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Connect to BlueZ
     let session = bluer::Session::new().await?;
-    let adapter = match &cli.adapter {
-        Some(name) => session.adapter(name)?,
-        None => session.default_adapter().await?,
-    };
-    tracing::info!("Using adapter: {}", adapter.name());
-
     let filter_addr: Option<bluer::Address> = cli
         .device
         .map(|s| s.parse().context("failed to parse device address"))
         .transpose()?;
+    let adapter = ble::select_adapter(&session, cli.adapter.as_deref(), filter_addr).await?;
+    tracing::info!(
+        "Using adapter: {} ({})",
+        adapter.name(),
+        adapter.address().await?
+    );
 
     let timeouts = atvv::SessionTimeouts {
         frame_timeout: std::time::Duration::from_secs(cli.frame_timeout),
@@ -249,7 +291,11 @@ async fn main() -> anyhow::Result<()> {
         };
 
         tokio::select! {
-            _ = ensure_connected(&device) => {}
+            wait = ensure_connected(&device) => {
+                if let ConnectWait::DeviceGone = wait {
+                    return Err(gone_error(&device));
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutting down");
                 return Ok(());
@@ -399,14 +445,18 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
-            tracing::info!("Negotiated protocol: {} ({:?}, {}Hz)", session_protocol.version(), codec, codec.sample_rate());
+            tracing::info!(
+                "Negotiated protocol: {} ({:?}, {}Hz)",
+                session_protocol.version(),
+                codec,
+                codec.sample_rate()
+            );
 
             let sample_rate = codec.sample_rate();
             let (frame_tx, mut frame_rx) =
                 tokio::sync::mpsc::channel::<protocol::types::AudioFrame>(DECODER_CHANNEL_CAPACITY);
             let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-            let (pw_shutdown_tx, pw_shutdown_rx) =
-                pipewire::channel::channel::<pw::Shutdown>();
+            let (pw_shutdown_tx, pw_shutdown_rx) = pipewire::channel::channel::<pw::Shutdown>();
 
             let (consumer_tx, consumer_rx) = if cli.mic_on_demand {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -431,13 +481,24 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            // Post-processing task: Protocol already decoded the audio,
-            // so we just apply declip/lowpass/gain and forward PCM.
+            // Post-processing task: Protocol already decoded the audio, so we apply
+            // declip/lowpass/high-pass/fade-in here and forward PCM (gain is applied in the PipeWire thread).
+            let mut stream_filter =
+                adpcm::StreamFilter::new(sample_rate, cli.highpass, cli.fade_in);
+            tracing::info!(
+                "Post-processing: high-pass {} Hz, fade-in {} ms (0 = off)",
+                cli.highpass,
+                cli.fade_in
+            );
             let decoder_handle = tokio::spawn(async move {
                 while let Some(frame) = frame_rx.recv().await {
+                    if frame.stream_start {
+                        stream_filter.start_stream();
+                    }
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
+                    stream_filter.process(&mut samples);
                     let _ = pcm_tx.send(samples);
                 }
             });
@@ -508,7 +569,10 @@ async fn main() -> anyhow::Result<()> {
 
             // Wait for device to reconnect (C1: interruptible by ctrl+c)
             tokio::select! {
-                _ = ensure_connected(&device) => {
+                wait = ensure_connected(&device) => {
+                    if let ConnectWait::DeviceGone = wait {
+                        return Err(gone_error(&device));
+                    }
                     tracing::info!("Device reconnected");
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -554,4 +618,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn default_gain_is_8_db() {
+        assert_eq!(Cli::parse_from(["atvvoice"]).gain, 8.0);
+    }
 }

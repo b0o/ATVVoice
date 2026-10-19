@@ -35,6 +35,9 @@ pub trait Protocol: Send {
 
     /// Handle AUDIO_SYNC (update internal decoder state).
     fn on_audio_sync(&mut self, sync: &AudioSyncData);
+
+    /// Handle AUDIO_START: forget per-stream state left over from the previous stream.
+    fn on_audio_start(&mut self) {}
 }
 
 /// Negotiate the best codec from the intersection of remote and our support.

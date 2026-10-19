@@ -195,6 +195,68 @@ pub fn lowpass(samples: &mut [i16]) {
     }
 }
 
+/// Per-stream post-processing: a first-order high-pass (DC blocker) followed by a linear fade-in.
+///
+/// The remote's microphone powers up with a DC offset that settles over ~250 ms, heard as a low "pop"
+/// at the start of every stream, and keeps a small DC offset afterwards; the high-pass removes both.
+/// The fade-in hides the step from silence to the first frame. State carries across frames and is
+/// reset by [`StreamFilter::start_stream`]. A cutoff or fade length of 0 disables that stage.
+pub struct StreamFilter {
+    alpha: Option<f32>,
+    fade_len: usize,
+    fade_pos: usize,
+    x_prev: f32,
+    y_prev: f32,
+    primed: bool,
+}
+
+impl StreamFilter {
+    pub fn new(sample_rate: u32, highpass_hz: f32, fade_in_ms: f32) -> Self {
+        let alpha = (highpass_hz > 0.0).then(|| {
+            let rc = 1.0 / (2.0 * std::f32::consts::PI * highpass_hz);
+            let dt = 1.0 / sample_rate as f32;
+            rc / (rc + dt)
+        });
+        let fade_len = (fade_in_ms.max(0.0) / 1000.0 * sample_rate as f32).round() as usize;
+        Self {
+            alpha,
+            fade_len,
+            fade_pos: fade_len,
+            x_prev: 0.0,
+            y_prev: 0.0,
+            primed: false,
+        }
+    }
+
+    /// Begin a new stream: the next sample re-seeds the high-pass (so it does not step) and the fade restarts.
+    pub fn start_stream(&mut self) {
+        self.primed = false;
+        self.fade_pos = 0;
+    }
+
+    pub fn process(&mut self, samples: &mut [i16]) {
+        for s in samples.iter_mut() {
+            let mut v = *s as f32;
+            if let Some(alpha) = self.alpha {
+                if !self.primed {
+                    self.x_prev = v;
+                    self.y_prev = 0.0;
+                    self.primed = true;
+                }
+                let y = alpha * (self.y_prev + v - self.x_prev);
+                self.x_prev = v;
+                self.y_prev = y;
+                v = y;
+            }
+            if self.fade_pos < self.fade_len {
+                v *= self.fade_pos as f32 / self.fade_len as f32;
+                self.fade_pos += 1;
+            }
+            *s = v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+}
+
 /// Apply gain using a precomputed linear multiplier with clamping.
 ///
 /// Use this on hot paths where the same gain is applied to many frames.
@@ -469,6 +531,110 @@ mod tests {
     }
 
     // --- Post-processing tests ---
+
+    // ── StreamFilter: high-pass + fade-in per stream ──────────────────
+
+    fn sine(freq: f32, amp: f32, n: usize, rate: u32) -> Vec<i16> {
+        (0..n)
+            .map(|i| {
+                (amp * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin()) as i16
+            })
+            .collect()
+    }
+
+    fn rms(x: &[i16]) -> f32 {
+        (x.iter().map(|&v| (v as f32).powi(2)).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn test_stream_filter_highpass_removes_dc() {
+        let mut f = StreamFilter::new(16_000, 80.0, 0.0);
+        f.start_stream();
+        let mut x = vec![2000i16; 1600]; // 100 ms of pure DC
+        f.process(&mut x);
+        assert_eq!(x[0], 0, "first sample of a stream must not step");
+        assert!(
+            x[1500..].iter().all(|&v| v.abs() <= 2),
+            "DC must be gone after 100 ms: {:?}",
+            &x[1500..1510]
+        );
+    }
+
+    #[test]
+    fn test_stream_filter_highpass_passes_speech_band() {
+        let mut f = StreamFilter::new(16_000, 80.0, 0.0);
+        f.start_stream();
+        let mut x = sine(1000.0, 8000.0, 3200, 16_000);
+        let before = rms(&x[1600..]);
+        f.process(&mut x);
+        let after = rms(&x[1600..]);
+        assert!(
+            after / before > 0.97,
+            "1 kHz must pass: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn test_stream_filter_state_carries_across_frames() {
+        let mut whole = StreamFilter::new(16_000, 80.0, 0.0);
+        let mut split = StreamFilter::new(16_000, 80.0, 0.0);
+        whole.start_stream();
+        split.start_stream();
+        let x: Vec<i16> = sine(300.0, 5000.0, 640, 16_000)
+            .iter()
+            .map(|v| v + 1500)
+            .collect();
+        let mut a = x.clone();
+        whole.process(&mut a);
+        let (mut b1, mut b2) = (x[..320].to_vec(), x[320..].to_vec());
+        split.process(&mut b1);
+        split.process(&mut b2);
+        assert_eq!(a, [b1, b2].concat());
+    }
+
+    #[test]
+    fn test_stream_filter_fade_in_ramps_from_zero() {
+        let mut f = StreamFilter::new(16_000, 0.0, 20.0); // 20 ms = 320 samples, no high-pass
+        f.start_stream();
+        let mut x = vec![1000i16; 640];
+        f.process(&mut x);
+        assert_eq!(x[0], 0);
+        assert!(x[..320].windows(2).all(|w| w[0] <= w[1]), "ramp must rise");
+        assert!(
+            (x[160] - 500).abs() <= 5,
+            "half way at 10 ms, got {}",
+            x[160]
+        );
+        assert!(
+            x[320..].iter().all(|&v| v == 1000),
+            "after the fade the signal is untouched"
+        );
+    }
+
+    #[test]
+    fn test_stream_filter_restarts_on_new_stream() {
+        let mut f = StreamFilter::new(16_000, 0.0, 20.0);
+        f.start_stream();
+        let mut x = vec![1000i16; 640];
+        f.process(&mut x);
+        f.start_stream();
+        let mut y = vec![1000i16; 10];
+        f.process(&mut y);
+        assert_eq!(y[0], 0, "a new stream fades in again");
+    }
+
+    #[test]
+    fn test_stream_filter_disabled_is_passthrough() {
+        let mut f = StreamFilter::new(16_000, 0.0, 0.0);
+        f.start_stream();
+        let x: Vec<i16> = sine(200.0, 6000.0, 500, 16_000)
+            .iter()
+            .map(|v| v + 900)
+            .collect();
+        let mut y = x.clone();
+        f.process(&mut y);
+        assert_eq!(x, y);
+    }
 
     #[test]
     fn test_declip_removes_spike() {

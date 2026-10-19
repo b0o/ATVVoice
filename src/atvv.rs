@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
 use crate::consumer;
-use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, StreamId};
+use crate::protocol::types::{AudioFrame, AudioStartReason, AudioStopReason, CtlEvent, StreamId};
 use crate::protocol::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,22 @@ impl std::fmt::Display for State {
             Self::Streaming => write!(f, "streaming"),
         }
     }
+}
+
+/// A hold-to-talk press shorter than this is a tap: it toggles a persistent
+/// `MIC_OPEN` stream instead of streaming only while held.
+const HTT_HOLD_THRESHOLD: Duration = Duration::from_millis(550);
+
+// Some HTT remotes acknowledge MIC_OPEN but only send audio while held.
+const HTT_TAP_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A physical mic press on a hold-to-talk remote, from its
+/// `AUDIO_START(HoldToTalk)` until `AUDIO_STOP(HttButtonRelease)`.
+#[derive(Debug, Clone, Copy)]
+struct HttPress {
+    began: Instant,
+    /// Whether the mic was already open (or opening) when the press began.
+    was_open: bool,
 }
 
 /// Commands that can be sent from external sources (D-Bus, CLI, etc.).
@@ -123,6 +139,7 @@ pub async fn run_session(
         mic_on_demand,
     } = config;
     let mut state = State::Connected;
+    let mut tap_waiting_for_audio = false;
 
     // set_state takes &mut State as a parameter rather than capturing it because
     // `state` is used independently in the tokio::select! branches below. Capturing
@@ -144,6 +161,7 @@ pub async fn run_session(
             set_state(State::Connected, &mut $state);
             $last_seq = None;
             $current_stream_id = None;
+            tap_waiting_for_audio = false;
         };
     }
 
@@ -160,7 +178,11 @@ pub async fn run_session(
     // Track the current stream ID (set on AudioStart, used for MIC_CLOSE/keepalive).
     let mut current_stream_id: Option<StreamId> = None;
 
+    // Physical press in progress on a hold-to-talk remote, if any.
+    let mut htt_press: Option<HttPress> = None;
 
+    // Set on AUDIO_START of a new stream; the next audio frame carries it to post-processing.
+    let mut stream_starting = false;
 
     // Keepalive: reset the remote's audio transfer timeout (spec §4.6.1)
     // using protocol.keepalive_cmd() (MIC_EXTEND for v1.0, MIC_OPEN for v0.4).
@@ -175,6 +197,9 @@ pub async fn run_session(
     tokio::pin!(frame_timer);
     let frame_timeout_enabled = !timeouts.frame_timeout.is_zero();
 
+    let tap_frame_timer = time::sleep(HTT_TAP_FIRST_FRAME_TIMEOUT);
+    tokio::pin!(tap_frame_timer);
+
     loop {
         tokio::select! {
             Some(data) = ctl_stream.next() => {
@@ -182,6 +207,42 @@ pub async fn run_session(
                     continue;
                 }
                 match protocol.parse_ctl(&data) {
+                    CtlEvent::AudioStop { reason: AudioStopReason::HttButtonRelease } if htt_press.is_some() => {
+                        let press = htt_press.take().expect("guarded by is_some");
+                        let held = press.began.elapsed();
+                        if held < HTT_HOLD_THRESHOLD && !press.was_open {
+                            // Tap from idle: keep the mic open after release.
+                            tracing::info!("AUDIO_STOP (reason=HttButtonRelease) after {:?} tap - opening persistent stream", held);
+                            // Go straight to Opening (no Connected blip for state listeners).
+                            last_seq = None;
+                            current_stream_id = None;
+                            ble.write_command(&protocol.mic_open_cmd()).await?;
+                            tracing::info!("Sent MIC_OPEN (HTT tap)");
+                            set_state(State::Opening, &mut state);
+                            tap_waiting_for_audio = true;
+                            tap_frame_timer.as_mut().reset(Instant::now() + HTT_TAP_FIRST_FRAME_TIMEOUT);
+                            if frame_timeout_enabled {
+                                frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
+                            }
+                        } else {
+                            // Hold released, or a tap while open (toggle off). The remote
+                            // already stopped its HTT stream, so no MIC_CLOSE is needed.
+                            tracing::info!(
+                                "AUDIO_STOP (reason=HttButtonRelease) after {:?} {} - closing",
+                                held,
+                                if held < HTT_HOLD_THRESHOLD { "tap" } else { "hold" }
+                            );
+                            close_mic_reset!(state, last_seq, current_stream_id);
+                        }
+                    }
+                    CtlEvent::AudioStop { reason: AudioStopReason::HttButtonRelease }
+                        if state == State::Opening
+                            || (state == State::Streaming && current_stream_id == Some(StreamId::MIC_OPEN)) =>
+                    {
+                        // A release with no tracked press cannot end a host-opened stream
+                        // (some remotes report a release for every key, not just the mic key).
+                        tracing::debug!("AUDIO_STOP (reason=HttButtonRelease) without HTT press - ignored, host-opened stream continues");
+                    }
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
                         // For HTT button release, remote already stopped — don't send `MIC_CLOSE`
@@ -196,8 +257,20 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
+                        // A repeated AUDIO_START while already streaming (v0.4 keepalive) is not a new stream.
+                        if state != State::Streaming {
+                            stream_starting = true;
+                        }
+                        if reason == AudioStartReason::HoldToTalk {
+                            tap_waiting_for_audio = false;
+                            htt_press = Some(HttPress {
+                                began: Instant::now(),
+                                was_open: state == State::Streaming || state == State::Opening,
+                            });
+                        }
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
+                        protocol.on_audio_start();
                         current_stream_id = Some(stream_id);
                         set_state(State::Streaming, &mut state);
                         // Reset keepalive timer when streaming starts/restarts
@@ -215,7 +288,11 @@ pub async fn run_session(
                     CtlEvent::StartSearch => {
                         tracing::info!("START_SEARCH (state={:?})", state);
 
-                        if state == State::Streaming || state == State::Opening {
+                        if htt_press.is_some() {
+                            // Hold-to-talk remotes announce the same press with both
+                            // AUDIO_START(HoldToTalk) and START_SEARCH; the release decides.
+                            tracing::debug!("START_SEARCH during HTT press - ignored");
+                        } else if state == State::Streaming || state == State::Opening {
                             // Toggle: second press stops streaming
                             let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                             ble.write_command(&protocol.mic_close_cmd(sid)).await?;
@@ -242,6 +319,7 @@ pub async fn run_session(
                         if state == State::Opening {
                             set_state(State::Connected, &mut state);
                             current_stream_id = None;
+                            tap_waiting_for_audio = false;
                         }
                     }
                     CtlEvent::Unknown(ref raw) => {
@@ -251,7 +329,9 @@ pub async fn run_session(
             }
             Some(data) = rx_stream.next() => {
                 if state == State::Streaming {
-                    if let Some(frame) = protocol.decode_audio(&data) {
+                    if let Some(mut frame) = protocol.decode_audio(&data) {
+                        tap_waiting_for_audio = false;
+                        frame.stream_start = std::mem::take(&mut stream_starting);
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
                             frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
@@ -274,6 +354,8 @@ pub async fn run_session(
                         if audio_tx.send(frame).await.is_err() {
                             tracing::warn!("audio frame dropped: receiver channel full or closed");
                         }
+                    } else {
+                        tracing::debug!("RX notification rejected by decoder: {} bytes", data.len());
                     }
                 }
             }
@@ -353,6 +435,12 @@ pub async fn run_session(
                 tracing::debug!("Sending keepalive");
                 let _ = ble.write_command(&protocol.keepalive_cmd(sid)).await;
                 keepalive_timer.as_mut().reset(Instant::now() + keepalive_interval);
+            }
+            () = &mut tap_frame_timer, if tap_waiting_for_audio => {
+                tracing::warn!("No audio after HTT tap ({:?}), closing mic; this remote may require holding the button", HTT_TAP_FIRST_FRAME_TIMEOUT);
+                let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
+                ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                close_mic_reset!(state, last_seq, current_stream_id);
             }
             () = &mut frame_timer, if frame_timeout_enabled && (state == State::Streaming || state == State::Opening) => {
                 tracing::info!("Frame timeout ({:?}) - device likely asleep, closing mic", timeouts.frame_timeout);
@@ -474,10 +562,7 @@ mod tests {
                     .await
                     .take()
                     .expect("connection_events called more than once");
-                Ok(
-                    Box::pin(UnboundedReceiverStream::new(rx))
-                        as BleStream<DeviceConnectionEvent>,
-                )
+                Ok(Box::pin(UnboundedReceiverStream::new(rx)) as BleStream<DeviceConnectionEvent>)
             })
         }
     }
@@ -493,7 +578,9 @@ mod tests {
     }
 
     /// Helper: receive all currently buffered commands from the mock controls.
-    async fn try_recv_all_commands(rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Vec<u8>> {
+    async fn try_recv_all_commands(
+        rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
         let mut cmds = Vec::new();
         while let Ok(cmd) = rx.try_recv() {
             cmds.push(cmd);
@@ -882,8 +969,6 @@ mod tests {
         let result = session.await.unwrap();
         assert!(result.is_ok());
     }
-
-
 
     // ── Test: Consumer connect triggers MIC_OPEN when Connected ────
 
@@ -1431,9 +1516,7 @@ mod tests {
         assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
 
         // AUDIO_STOP with reason=HttButtonRelease (0x02) → should NOT send MIC_CLOSE
-        ctrl.ctl_tx
-            .send(vec![CTL_AUDIO_STOP, 0x02])
-            .unwrap();
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP, 0x02]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
 
@@ -1450,5 +1533,347 @@ mod tests {
             .unwrap();
         let result = session.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    // ── Hold-to-talk gestures (Chromecast Voice Remote, v1.0 HTT) ───────
+    //
+    // On a physical mic press this remote sends AUDIO_START(reason=HoldToTalk)
+    // immediately followed by START_SEARCH, and AUDIO_STOP(HttButtonRelease)
+    // on release. A short tap toggles a persistent MIC_OPEN stream; a hold
+    // streams only while the button is held.
+
+    struct HttSession {
+        ctrl: MockControls,
+        audio_rx: tokio_mpsc::Receiver<AudioFrame>,
+        state_rx: tokio::sync::watch::Receiver<State>,
+        session: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    async fn spawn_v10_htt_session() -> HttSession {
+        use crate::protocol::v10::ProtocolV10;
+
+        let (device, ctrl) = mock_device();
+        let (audio_tx, audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(State::Connected);
+
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(160),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        HttSession {
+            ctrl,
+            audio_rx,
+            state_rx,
+            session,
+        }
+    }
+
+    impl HttSession {
+        async fn ctl(&mut self, data: &[u8], after: Duration) {
+            self.ctrl.ctl_tx.send(data.to_vec()).unwrap();
+            tokio::time::advance(after).await;
+            tokio::task::yield_now().await;
+        }
+
+        async fn expect_state(&mut self, expected: State) {
+            assert!(
+                wait_for_state(&mut self.state_rx, expected, Duration::from_millis(10)).await,
+                "expected state {expected:?}, got {:?}",
+                *self.state_rx.borrow()
+            );
+        }
+
+        async fn commands(&mut self) -> Vec<Vec<u8>> {
+            try_recv_all_commands(&mut self.ctrl.commands_rx).await
+        }
+
+        /// Physical press: AUDIO_START(HoldToTalk) + START_SEARCH, held for `hold`.
+        async fn press(&mut self, stream_id: u8, hold: Duration) {
+            self.ctl(
+                &[CTL_AUDIO_START, 0x03, 0x02, stream_id],
+                Duration::from_millis(1),
+            )
+            .await;
+            self.ctl(&[CTL_START_SEARCH], hold).await;
+        }
+
+        async fn release(&mut self) {
+            self.ctl(&[CTL_AUDIO_STOP, 0x02], Duration::from_millis(1))
+                .await;
+        }
+
+        async fn finish(self) {
+            self.ctrl
+                .event_tx
+                .send(DeviceConnectionEvent::Disconnected)
+                .unwrap();
+            assert!(self.session.await.unwrap().is_ok());
+        }
+    }
+
+    const V10_MIC_OPEN: &[u8] = &[0x0C, 0x00];
+
+    #[tokio::test]
+    async fn test_htt_tap_without_audio_closes_and_allows_next_hold() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        // Invalid RX data must not count as a first audio frame.
+        s.ctrl.rx_tx.send(vec![]).unwrap();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        s.expect_state(State::Streaming).await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+        s.expect_state(State::Connected).await;
+        assert_eq!(s.commands().await, vec![vec![0x0D, 0x00]]);
+
+        s.press(0x03, Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        assert!(s.commands().await.is_empty());
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_tap_without_audio_start_closes() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        s.expect_state(State::Opening).await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        s.expect_state(State::Connected).await;
+        assert_eq!(s.commands().await, vec![vec![0x0D, 0x00]]);
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_tap_first_frame_or_new_hold_cancels_start_timeout() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.ctrl.rx_tx.send(vec![0x11; 160]).unwrap();
+        s.audio_rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+
+        s.press(0x03, Duration::from_millis(150)).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        s.press(0x04, Duration::from_millis(150)).await;
+        s.release().await;
+        s.commands().await;
+        // A new physical hold replaces the pending host-opened stream.
+        s.press(0x05, Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        assert!(s.commands().await.is_empty());
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_start_search_during_press_does_not_close_mic() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(100)).await;
+        s.expect_state(State::Streaming).await;
+        let cmds = s.commands().await;
+        assert!(
+            cmds.is_empty(),
+            "START_SEARCH during an HTT press must be ignored, got: {cmds:?}"
+        );
+
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_hold_streams_until_release() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_secs(2)).await;
+        s.expect_state(State::Streaming).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        let cmds = s.commands().await;
+        assert!(
+            cmds.is_empty(),
+            "hold release must not send commands, got: {cmds:?}"
+        );
+
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_tap_toggles_persistent_stream() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        // First tap: release opens a persistent MIC_OPEN stream.
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        assert_eq!(s.commands().await, vec![V10_MIC_OPEN.to_vec()]);
+        s.expect_state(State::Opening).await;
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.expect_state(State::Streaming).await;
+
+        // A release report outside a tracked press must not drop the stream.
+        s.release().await;
+        s.expect_state(State::Streaming).await;
+
+        // Second tap: the remote switches to an HTT stream; release closes the session.
+        s.press(0x03, Duration::from_millis(150)).await;
+        s.expect_state(State::Streaming).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        let cmds = s.commands().await;
+        assert!(
+            !cmds.contains(&V10_MIC_OPEN.to_vec()),
+            "second tap must not reopen the mic, got: {cmds:?}"
+        );
+
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_hold_while_open_closes_on_release() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.expect_state(State::Streaming).await;
+        s.commands().await;
+
+        s.press(0x03, Duration::from_secs(2)).await;
+        s.release().await;
+        s.expect_state(State::Connected).await;
+        let cmds = s.commands().await;
+        assert!(!cmds.contains(&V10_MIC_OPEN.to_vec()), "got: {cmds:?}");
+
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_htt_release_without_press_does_not_abort_opening() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+
+        // Tap → MIC_OPEN sent, waiting for AUDIO_START.
+        s.press(0x02, Duration::from_millis(150)).await;
+        s.release().await;
+        s.expect_state(State::Opening).await;
+
+        // This remote reports a release for every key, not only the mic key.
+        s.release().await;
+        s.expect_state(State::Opening).await;
+
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.expect_state(State::Streaming).await;
+
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    async fn test_first_frame_of_a_new_stream_is_marked() {
+        tokio::time::pause();
+        let mut s = spawn_v10_htt_session().await;
+        let frame = || vec![0x11u8; 160];
+
+        // Hold-to-talk stream: the first frame starts a stream, the next does not.
+        s.press(0x02, Duration::from_millis(1)).await;
+        s.ctrl.rx_tx.send(frame()).unwrap();
+        s.ctrl.rx_tx.send(frame()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(s.audio_rx.recv().await.unwrap().stream_start);
+        assert!(!s.audio_rx.recv().await.unwrap().stream_start);
+
+        // A repeated AUDIO_START while already streaming (v0.4 keepalive style) is not a new stream.
+        s.ctl(
+            &[CTL_AUDIO_START, 0x03, 0x02, 0x02],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.ctrl.rx_tx.send(frame()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!s.audio_rx.recv().await.unwrap().stream_start);
+
+        // After the stream ends, a host-opened stream starts afresh.
+        s.ctl(&[CTL_AUDIO_STOP, 0x02], Duration::from_secs(1)).await;
+        s.expect_state(State::Connected).await;
+        s.ctl(
+            &[CTL_AUDIO_START, 0x00, 0x02, 0x00],
+            Duration::from_millis(1),
+        )
+        .await;
+        s.ctrl.rx_tx.send(frame()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(s.audio_rx.recv().await.unwrap().stream_start);
+
+        s.finish().await;
     }
 }
